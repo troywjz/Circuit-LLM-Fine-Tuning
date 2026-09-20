@@ -1,0 +1,184 @@
+# Circuit LLM Fine-Tuning V0 项目管理文档
+
+> 文档状态：规划基线（Planning Baseline）  
+> 版本：V0.1  
+> 当前阶段：Circuit Planning 能力验证与微调效果验证  
+> 维护原则：本文规定项目范围、交付物、质量门和验收方法；“计划做什么”不等于“已经实现什么”。
+
+## 1. 执行摘要
+
+本项目验证一个核心假设：高质量电路领域数据、稳定的工作流约束和参数高效微调，能否让较低成本模型在电路规划任务上更接近有经验的电子工程师。
+
+V0 的边界是“自然语言硬件需求 → Circuit Design Intent”。模型负责需求澄清、功能拆分、架构规划、器件比较、接口与引脚规划、外围电路提示、PCB 关键约束、风险和取舍说明，并以简短交互回答和可持续维护的 Markdown 文档交付。V0 不以自动生成完整 BOM、EDA 网表、原理图、PCB、布局布线或生产验证为目标。
+
+项目成功的判据不是训练命令成功运行，而是在冻结、独立且按项目切分的 Benchmark 上，Fine-Tuned Model 相对于 Base、Base+Prompt、Base+SKILL 基线，在正确性、完整性、规则遵循、稳定性和幻觉率等关键指标上取得可重复的提升。
+
+## 2. 目标、非目标与研究问题
+
+### 2.1 目标
+
+- 建立可复用的开源电路数据采集、解析、证据标注、Master Record 和 SFT 数据流水线。
+- 验证一种固定版本的嘉立创 EDA 源格式，并通过轻量 Circuit IR 隔离源格式与后续数据逻辑。
+- 形成 Circuit Planning SKILL、六类 Markdown 设计文档、评测 Schema 和可重复的实验记录。
+- 用冻结 Benchmark 比较不同提示、SKILL、微调模型组合，量化微调收益和代价。
+- 保留未来 Schematic Agent、PCB Agent 和 Review Agent 可消费的 Design Intent 层。
+
+### 2.2 非目标
+
+V0 不做多 EDA 格式兼容、通用 EDA 转换器、自动原理图绘制、自动 PCB Placement/Routing、完整器件数据库、SI/PI 仿真、生产级 DFM、超大模型训练、从零预训练和大规模产业部署。
+
+### 2.3 研究问题
+
+在相同或更低推理成本下，领域微调是否能使模型更稳定地完成需求澄清、工程取舍、引脚/接口规划、风险识别和 PCB 约束表达？提升来自模型参数、SKILL 还是外部器件资料，必须通过对照实验分离。
+
+## 3. 范围与交付物
+
+### 3.1 V0 范围内
+
+- 数据源：以嘉立创开源广场为主要来源，保留 URL、许可证、版本、下载日期和原始文件。
+- 输入契约：只支持一种明确的嘉立创 EDA 版本和工程源格式；代码必须记录 vendor、edition、format_version、parser_version、支持/不支持的图元。
+- 解析对象：Component、Reference、Value、Device/Part、Pin、Net、Power Net、Label、Sheet 和基础连接关系。
+- 数据任务：Existing Design Reconstruction、Forward Design、Requirement Clarification、Error/Conflict Detection、Component Trade-off，以及架构、Power Tree、Pin Planning、PCB Constraint 等子任务。
+- 质量控制：所有重要推断带 evidence_type、confidence、source_reference；Hypothesis 不得无标记进入高置信度核心训练集。
+
+### 3.2 交付物
+
+| 交付物 | 目的 | 主要验收证据 |
+|---|---|---|
+| `01_requirements.md` | 需求、约束、已确认项、待确认项、明确不做项 | 能识别影响架构的缺失信息 |
+| `02_circuit_plan.md` | 功能模块、电源树、数据/控制流、架构和取舍 | 方案可解释、可修改 |
+| `03_component_selection.md` | 候选器件、参数、优缺点、选择理由和重选条件 | 选型不是只有最终 BOM |
+| `04_pin_net_plan.md` | MCU 资源、复用、Pin-to-Pin、Net、上下拉、保护和冲突 | 规划清晰且区分未确认连接 |
+| `05_pcb_constraints.md` | 去耦、差分、回流、keepout、晶振、噪声、大电流、EMC 等约束 | 只保留与当前电路相关的关键约束 |
+| `06_design_review.md` | 风险、未验证假设、资料缺口、替代方案和下一步 | 问题可追踪、责任和状态明确 |
+| Circuit IR | 解耦 JLCEDA 字段与数据生成 | 可由 Parser 稳定生成、字段有版本 |
+| Master Record | 高信息密度的项目事实与推断中间层 | 可追溯、可拆分为多种任务 |
+| Dataset/Eval 报告 | 训练样本、冻结集、基线和实验结果 | 可复现、无项目级泄漏 |
+
+## 4. 技术与数据路线
+
+### 4.1 系统职责
+
+Prompt/SKILL 负责工作流程、模板、目录、检查步骤、交互长度和当前阶段边界；Fine-Tuning 负责工程思考习惯、需求澄清、器件权衡、接口规划、风险发现和解释质量；RAG/Datasheet 工具负责具体 Pinout、额定值、时序、供货和官方 Layout Guideline。微调不应被当作器件数据库。
+
+### 4.2 数据流水线
+
+```text
+JLCEDA Source
+  → Parser
+  → Circuit IR
+  → README/BOM/Datasheet/License 证据
+  → Teacher 候选 Master Record
+  → 规则校验与人工抽检
+  → 多类型 SFT / Eval Task
+```
+
+Master Record 至少包含 source、requirements、functional_blocks、components、interfaces、power_tree、pin_assignments、nets、design_decisions、layout_constraints、advantages、tradeoffs、risks、open_questions。每项设计决策记录 `evidence_type`、`confidence`、`source_reference`。
+
+证据分为：`SOURCE_FACT`（原始资料直接证明）、`DERIVED`（由可靠电气规则推导）、`HYPOTHESIS`（不能证明的合理猜测）、`UNCONFIRMED`（资料不足）。资料不足时必须停止可靠性要求高的推断，明确提出需要补充的 Datasheet、Reference Manual 或需求。
+
+### 4.3 数据量和切分
+
+V0 Pilot 建议 50～100 个有代表性的真实项目，每项目拆 5～15 个任务，形成约 500～1000 条高质量 SFT 样本，并单独建立 Benchmark。只有在 V0 Eval 明显有效后，才扩展到 300～500 个项目和 3000～5000+ 样本。Train/Validation/Test 必须按 Project 切分，禁止同一 Board 的不同任务跨集合；可另测 Unseen Board、Unseen MCU Family 和 Unseen Interface Combination。
+
+## 5. 里程碑与质量门
+
+执行顺序是先规格化，再解析和数据构造，再建立基线，最后微调与报告。每个里程碑只有在产物、验证记录和退出准则同时满足时才关闭。
+
+### M1 — Project Specification
+
+任务：确定目录、六类文档模板、Circuit Planning SKILL、Design Intent 最小 Schema、Dataset/Eval Schema 和证据标记。产物：规格文档、模板、样例。退出准则：字段职责无歧义，能从需求走到 Review，且明确 V0 不做项。
+
+### M2 — Single-format JLCEDA Parser
+
+任务：冻结一种 JLCEDA 输入格式，实现 Component/Pin/Net/Power/Label/Sheet 等最小解析。产物：V0 Ingestion Contract、Parser、夹具样例、解析覆盖率和失败清单。退出准则：已知样例可重复解析；不支持的图元显式报错或标记；不把源文件字段直接泄漏给下游业务逻辑。
+
+### M3 — Circuit IR 与 Master Record
+
+任务：实现版本化 IR，结合项目说明、BOM 和可靠资料生成候选 Master Record。产物：IR Schema、生成器、证据引用和人工抽检记录。退出准则：每个重要事实可回溯；推断不缺证据类型和置信度；无法确认的连接进入 open_questions。
+
+### M4 — Dataset Builder
+
+任务：从 Master Record 生成 Forward Design、Clarification、Explanation、Component Selection、Pin Planning、PCB Constraint、Error Detection 等任务。产物：数据生成器、样本 Schema、许可证和来源索引。退出准则：任务类型覆盖规划闭环；样本能由规则校验；项目级切分和去重检查通过。
+
+### M5 — Baseline 与冻结 Benchmark
+
+任务：在任何反复训练前冻结测试集，建立 Base、Base+Prompt、Base+SKILL 基线。产物：Eval Set、评分 Rubric、评测脚本、基线报告。退出准则：测试集与训练项目隔离；评分维度可复现；人工评分规则和自动检查边界已记录。
+
+### M6 — First Fine-Tuning
+
+任务：使用小尺寸模型进行低成本 SFT/LoRA/QLoRA 实验，比较数据、参数和任务类型影响。产物：训练配置、检查点元数据、成本/时长记录、过拟合和灾难性遗忘检查。退出准则：训练和推理可复现；没有以单次成功样例代替整体评测；异常结果有解释或标记。
+
+### M7 — Evaluation Report 与阶段决策
+
+任务：比较 Base、Base+Prompt、Base+SKILL、Fine-Tuned、Fine-Tuned+SKILL。产物：量化报告、错误案例、能力边界、下一阶段建议。退出准则：关键指标在独立测试集上有稳定变化；报告区分统计结果、人工判断和未验证假设；项目委员会据此决定继续、调整或停止。
+
+## 6. 评测与 V0 验收
+
+评测至少覆盖 Requirement Completeness、Architecture Correctness、Component Selection、Pin/Net Accuracy、Electrical Correctness、Constraint Recall、Rule Compliance、Hallucination Rate、Conciseness 和 Document Quality。特别检查模型是否先澄清缺失需求、是否解释关键决策、是否拒绝编造 Pin/参数、是否能维护六类 Markdown。
+
+V0 通过的必要条件：数据流水线可复用；一种 JLCEDA 格式可稳定解析；有独立 Benchmark；至少完成一轮小模型微调；Fine-Tuned Model 在关键指标上稳定优于基线；交互回答简洁；文档可持续编辑；资料不足时主动停止猜测；理由和 PCB 约束有可观察提升。没有预先虚构统一数值阈值，具体门槛应在 M5 基于基线分布和人工评分一致性确定。
+
+## 7. 角色、职责与协作方式
+
+主 Agent 负责理解需求、制定方案、拆分任务、选择验证方法、处理高风险工程判断、审阅 SubAgent 产物并作最终验收。GPT-5.6 Luna 等性价比 SubAgent 优先承担具体文档编辑、编码、数据处理、样本生成、常规测试和格式检查。SubAgent 不自行扩大范围；所有产物必须由主 Agent 复核，涉及器件事实、协议、电气安全、数据许可或验收结论的判断回到主 Agent。项目贡献按“计划、执行、证据、审阅、状态”记录，不以模型名称替代责任人。
+
+## 8. 风险登记与应对
+
+| 风险 | 影响 | 应对和触发条件 |
+|---|---|---|
+| 从成品反推原始意图不唯一 | 错误监督信号 | 严格区分三类证据；Hypothesis 不进入高置信核心集 |
+| Teacher 生成幻觉 | 训练后放大错误 | 回到 EDA/README/Datasheet，规则校验与人工抽检 |
+| 格式或下载不稳定 | 流水线不可复用 | 冻结单格式；记录版本；失败样本进入清单 |
+| 同板跨集合泄漏 | 评测虚高 | 以 Project 分组切分，运行重复/相似度检查 |
+| 只会解释已有电路 | 正向规划弱 | 强制加入 Forward Design、Clarification、Conflict 数据 |
+| 微调过拟合或遗忘 | 泛化下降 | 保留基线，监控未见板和通用能力，比较多轮结果 |
+| 器件事实过时 | 电气判断失真 | 采用 RAG/官方资料，不把参数写死进微调目标 |
+| 范围蔓延到 EDA 自动生成 | 成本和周期失控 | 变更评审；任何超出 V0 的工作单独立项 |
+
+## 9. 依赖、变更和沟通
+
+外部依赖包括 JLCEDA 源文件可获得性、许可证、官方器件资料、训练硬件和模型运行环境。依赖变更必须记录影响、替代方案和是否改变验收。
+
+项目变更采用“提议—影响分析—主 Agent 决策—更新文档/Schema—验证”的流程。改变输入格式、数据切分、核心指标、V0 范围或验收标准属于重大变更，必须留下决策记录。常规工作以里程碑状态更新；每次更新至少说明已完成、证据位置、风险、阻塞项和下一步。任何报告必须区分已实现、部分实现、待验证和规划目标。
+
+## 10. V0 Definition of Done 与近期行动
+
+V0 只有在 M1～M7 的退出准则均满足、数据和评测报告可复现、关键结果经过主 Agent 审阅，并形成 Model、Dataset、Circuit IR、Design Intent Schema、SKILL/Workflow、Benchmark、Evaluation Report 七项资产后，才可宣布“路线得到初步验证”。这不等同于物理板卡验收、量产验证或替代电子工程师。
+
+近期行动顺序：
+
+1. 建立项目目录、六类模板、SKILL、Dataset/Eval/IR Schema。
+2. 选定并记录唯一 JLCEDA 输入格式，准备最小解析夹具。
+3. 选取少量有许可证和来源信息的项目，生成首批 Master Record 并人工抽检。
+4. 冻结小规模 Benchmark，先运行 Base、Prompt 和 SKILL 基线。
+5. 再运行小模型 SFT/LoRA/QLoRA，输出第一版比较报告。
+
+## 附录 A：建议目录
+
+```text
+docs/  skill/templates/  data/{raw,parsed,master_records,sft,eval}/
+src/{ingestion,ir,dataset,teacher,validators,evaluation}/
+configs/{model,training,dataset}/ scripts/ experiments/{baseline,lora,reports}/
+```
+
+## 附录 B：最小 IR 与决策记录
+
+```json
+{
+  "project": {}, "components": [], "pins": [], "nets": [],
+  "power_nets": [], "interfaces": [], "labels": [], "sheets": [],
+  "schema_version": "0.1.0"
+}
+```
+
+```json
+{
+  "decision": "...",
+  "reason": "...",
+  "evidence_type": "SOURCE_FACT | DERIVED | HYPOTHESIS | UNCONFIRMED",
+  "confidence": 0.0,
+  "source_reference": "..."
+}
+```
+
