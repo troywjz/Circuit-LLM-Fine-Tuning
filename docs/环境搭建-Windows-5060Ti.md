@@ -3,7 +3,7 @@
 目标：在本机跑通 Qwen3.5-4B 的推理与 QLoRA 微调。
 预计耗时 1–2 小时，其中大头是下载（模型权重约 9.3GB）。
 
-> 名词速查见 [术语表.md](术语表.md)。本页命令均在 **命令提示符（cmd）** 或 **PowerShell** 中执行。
+> 本页命令均在 **命令提示符（cmd）** 或 **PowerShell** 中执行，专业名词随文解释。
 
 ## 0. 检查显卡驱动
 
@@ -120,7 +120,7 @@ print(tok.decode(m.generate(ids, max_new_tokens=256)[0][ids.shape[1]:], skip_spe
 | `per_device_train_batch_size` | 1 | 一批喂几条样本 |
 | `gradient_accumulation_steps` | 8 | 攒 8 批再更新一次参数，等效大批量 |
 | `lora r` | 16 | 适配器的"容量"，越大越能学但越容易过拟合 |
-| `num_train_epochs` | 1–2 | 训练轮次，见术语表 |
+| `num_train_epochs` | 1–2 | epoch 即"把全部训练数据学完一遍"，学太多遍会变成背答案 |
 
 **先拿 5–20 条样本试跑 10 步**，确认能跑通、显存不爆，再上正式数据。
 
