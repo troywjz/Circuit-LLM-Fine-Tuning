@@ -1,6 +1,6 @@
 # 环境搭建：Windows + RTX 5060 Ti 8GB
 
-目标：在本机跑通 Qwen3.5-4B 的推理与 QLoRA 微调。
+目标：在本机跑通 Qwen3.5-4B 的推理与 QLoRA 微调。  
 预计耗时 1–2 小时，其中大头是下载（模型权重约 9.3GB）。
 
 > 本页命令均在 **命令提示符（cmd）** 或 **PowerShell** 中执行，专业名词随文解释。
@@ -14,28 +14,33 @@ nvidia-smi
 ```
 
 看右上角 **CUDA Version** 是否 ≥ 12.8（这是驱动支持的上限，不是已安装的 CUDA）。
+
 - ≥ 12.8 → 继续下一步。
-- < 12.8 → 去 https://www.nvidia.cn/geforce/drivers/ 下载最新驱动安装。
+- < 12.8 → 去 <https://www.nvidia.cn/geforce/drivers/> 下载最新驱动安装。
 
-## 1. 安装 Python 3.12
+## 1. 确认 Python 版本（本机已够用，无需新装）
 
-- 地址：https://www.python.org/downloads/windows/
-- 下载 `Windows installer (64-bit)` 的 3.12 最新小版本。
-- 安装时**必须勾选** `Add python.exe to PATH`。
-- 验证：新开 cmd，执行 `python --version`，应显示 `Python 3.12.x`。
+本机现状（2026-10-07 实测）：
 
-> 本机已有 Python 3.13，也能用；但 3.12 是各家微调框架测试最充分的版本，能少踩坑。
+| 位置 | 版本 | 说明 |
+| --- | --- | --- |
+| 系统默认 `python` | 3.13.14 | 日常使用，不动它 |
+| uv 托管的 CPython | 3.12.13 | 训练环境用它 |
+
+3.13 本身可用——PyTorch cu128、bitsandbytes、triton 都提供对应的 3.13 轮子（实测已确认）。但**训练环境仍建议用 3.12**：各家微调框架测试最充分，遇到库的兼容问题时少一层变量；而 3.12 本机已经有了，用 uv 建环境零成本，不必重新下载。
+
+验证命令：`python --version`（应显示 3.13.14）、`uv python list`（应能看到 3.12.13）。
 
 ## 2. 安装 Visual Studio 生成工具 2022
 
-- 地址：https://visualstudio.microsoft.com/visual-cpp-build-tools/
+- 地址：<https://visualstudio.microsoft.com/visual-cpp-build-tools/>
 - 下载"生成工具"，安装时勾选 **使用 C++ 的桌面开发**（约 3–6GB）。
 
 > 为什么需要：加速库 Triton 第一次运行要现场编译显卡内核，机器上没有 C 语言编译器就会报 `Failed to find C compiler`。
 
 ## 3. 安装 VC++ 运行库
 
-- 地址：https://aka.ms/vs/17/release/vc_redist.x64.exe
+- 地址：<https://aka.ms/vs/17/release/vc_redist.x64.exe>
 
 ## 4. 创建虚拟环境
 
@@ -43,10 +48,11 @@ nvidia-smi
 
 ```bat
 cd /d D:\code\Circuit LLM Fine-Tuning
-py -3.12 -m venv .venv
+uv venv .venv --python 3.12
 .venv\Scripts\activate
-python -m pip install -U pip uv
 ```
+
+uv 会直接使用已装好的 3.12.13，不会重新下载 Python。验证：`python --version` 应显示 `Python 3.12.13`。
 
 > 虚拟环境（venv）是 Python 的一份独立副本，装在这里的库不会影响系统。看到命令行前面出现 `(.venv)` 就说明已激活；换新窗口要重新执行 `.venv\Scripts\activate`。
 
@@ -76,6 +82,7 @@ python -c "import torch;print(torch.__version__, torch.cuda.is_available(), torc
 ```
 
 期望输出类似：`2.x.x+cu128 True NVIDIA GeForce RTX 5060 Ti (12, 0)`
+
 - `True` = 显卡能被调用。
 - `(12, 0)` = 计算能力 12.0，即 sm_120，说明 Blackwell 识别正常。
 
@@ -87,8 +94,8 @@ python -c "import torch;print(torch.__version__, torch.cuda.is_available(), torc
 modelscope download --model Qwen/Qwen3.5-4B --local_dir D:\models\Qwen3.5-4B
 ```
 
-- 国内首选 ModelScope（阿里自家，速度稳定，无需代理）：https://modelscope.cn/models/Qwen/Qwen3.5-4B
-- 国外源 HuggingFace：https://huggingface.co/Qwen/Qwen3.5-4B （走代理）
+- 国内首选 ModelScope（阿里自家，速度稳定，无需代理）：<https://modelscope.cn/models/Qwen/Qwen3.5-4B>
+- 国外源 HuggingFace：<https://huggingface.co/Qwen/Qwen3.5-4B> （走代理）
 
 > 部署用的 GGUF 格式（体积小、给推理软件用）后面单独下，不要和这份混在一起。
 
@@ -110,17 +117,17 @@ print(tok.decode(m.generate(ids, max_new_tokens=256)[0][ids.shape[1]:], skip_spe
 
 ## 10. 跑通一次微调
 
-- 官方入门笔记本：https://github.com/unslothai/unsloth （Notebooks 一章里找 Qwen 的 QLoRA 例子）
+- 官方入门笔记本：<https://github.com/unslothai/unsloth> （Notebooks 一章里找 Qwen 的 QLoRA 例子）
 - 8GB 显存建议参数：
 
-| 参数 | 建议值 | 说明 |
-|---|---|---|
-| `max_seq_length` | 1024–2048 | 单条样本的最大长度，越高越吃显存 |
-| `load_in_4bit` | True | 4 位加载，省显存的关键开关 |
-| `per_device_train_batch_size` | 1 | 一批喂几条样本 |
-| `gradient_accumulation_steps` | 8 | 攒 8 批再更新一次参数，等效大批量 |
-| `lora r` | 16 | 适配器的"容量"，越大越能学但越容易过拟合 |
-| `num_train_epochs` | 1–2 | epoch 即"把全部训练数据学完一遍"，学太多遍会变成背答案 |
+| 参数                            | 建议值       | 说明                              |
+| ----------------------------- | --------- | ------------------------------- |
+| `max_seq_length`              | 1024–2048 | 单条样本的最大长度，越高越吃显存                |
+| `load_in_4bit`                | True      | 4 位加载，省显存的关键开关                  |
+| `per_device_train_batch_size` | 1         | 一批喂几条样本                         |
+| `gradient_accumulation_steps` | 8         | 攒 8 批再更新一次参数，等效大批量              |
+| `lora r`                      | 16        | 适配器的"容量"，越大越能学但越容易过拟合           |
+| `num_train_epochs`            | 1–2       | epoch 即"把全部训练数据学完一遍"，学太多遍会变成背答案 |
 
 **先拿 5–20 条样本试跑 10 步**，确认能跑通、显存不爆，再上正式数据。
 
@@ -128,15 +135,15 @@ print(tok.decode(m.generate(ids, max_new_tokens=256)[0][ids.shape[1]:], skip_spe
 
 微调产出的是适配器文件，需要先合并回基座模型，再导出 GGUF 给推理软件：
 
-1. 下载推理软件：LM Studio（图形界面，最省事）https://lmstudio.ai 或 Ollama https://ollama.com
+1. 下载推理软件：LM Studio（图形界面，最省事）<https://lmstudio.ai> 或 Ollama <https://ollama.com>
 2. 在 LM Studio 里直接搜索 `Qwen3.5-4B-GGUF`，选 `Q4_K_M` 量化版（约 2.8GB），即可对话。
 
 ## 12. 常见报错对照
 
-| 现象 | 原因 | 解决 |
-|---|---|---|
-| `no kernel image is available` | PyTorch 装成了 CPU 版或 cu126 | 重装第 5 步的 cu128 版 |
-| `Failed to find C compiler` | 缺 C 编译器 | 回到第 2 步装生成工具，并用 x64 原生工具命令提示符运行 |
-| `CUDA out of memory` | 显存不足 | 降 `max_seq_length`，确保 `load_in_4bit=True` |
-| Unsloth 提示不支持 `qwen3_5` 架构 | 框架还没跟上新架构 | 改用 `transformers + peft + trl` 标准 QLoRA，或换 Qwen3-4B-Instruct-2507（老架构，生态成熟） |
-| 解包 DLL 失败 | 缺运行库 | 回到第 3 步 |
+| 现象                             | 原因                       | 解决                                                                          |
+| ------------------------------ | ------------------------ | --------------------------------------------------------------------------- |
+| `no kernel image is available` | PyTorch 装成了 CPU 版或 cu126 | 重装第 5 步的 cu128 版                                                            |
+| `Failed to find C compiler`    | 缺 C 编译器                  | 回到第 2 步装生成工具，并用 x64 原生工具命令提示符运行                                             |
+| `CUDA out of memory`           | 显存不足                     | 降 `max_seq_length`，确保 `load_in_4bit=True`                                   |
+| Unsloth 提示不支持 `qwen3_5` 架构     | 框架还没跟上新架构                | 改用 `transformers + peft + trl` 标准 QLoRA，或换 Qwen3-4B-Instruct-2507（老架构，生态成熟） |
+| 解包 DLL 失败                      | 缺运行库                     | 回到第 3 步                                                                     |
