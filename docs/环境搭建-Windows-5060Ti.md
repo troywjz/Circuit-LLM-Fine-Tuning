@@ -57,7 +57,18 @@ nvidia-smi
 
 唯一值得动的是 **取消勾选「安装后保留下载缓存」**：那 1.65GB 是安装完就没用的中间文件，取消后自动清掉。另注：共享组件里有一部分工具和 SDK，无论怎么改路径都会装回系统盘。
 
-验证：**新开**一个窗口执行 `cl`，看到 `Microsoft (R) C/C++ ...` 的版本信息即成功。
+验证（**注意：不能在普通 cmd 里直接敲 `cl`**）：MSVC 故意不把编译器写进系统 PATH——`cl.exe` 有多个版本 × 目标架构的组合，全局加进去会互相打架。要用它，得先加载一整套环境变量：
+
+- **方式 A（推荐）**：开始菜单 → `Visual Studio 2026` → `Visual Studio Tools` → `VC` → **x64 Native Tools Command Prompt for VS**。这个窗口一开就配好了环境，敲 `cl` 会显示版本信息。
+- **方式 B**：在任意 cmd 里先执行一行（路径含空格和括号，双引号不能省），然后再敲 `cl`：
+
+  ```bat
+  "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\Common7\Tools\VsDevCmd.bat" -arch=amd64
+  ```
+
+本机实测的 `cl.exe` 位置：`C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64\cl.exe`。
+
+> **日常约定**：后面跑 Python 训练和推理，都从方式 A 的窗口启动。Triton 找 C 编译器看的是 `VCINSTALLDIR`、`VCToolsVersion`、`WindowsSdkDir` 这些环境变量，在这类窗口里都已经有了，**不需要把 `cl` 挂进系统 PATH**。
 
 > 为什么需要：加速库 Triton 第一次运行要现场编译显卡内核，机器上没有 C 语言编译器就会报 `Failed to find C compiler`。
 >
@@ -86,6 +97,8 @@ uv venv .venv --python 3.12
 uv 会直接使用已装好的 3.12.13，不会重新下载 Python。验证：`python --version` 应显示 `Python 3.12.13`。
 
 > 虚拟环境（venv）是 Python 的一份独立副本，装在这里的库不会影响系统。看到命令行前面出现 `(.venv)` 就说明已激活；换新窗口要重新执行 `.venv\Scripts\activate`。
+>
+> **本步之后的所有 Python 命令，都在第 2 步方式 A 的「x64 Native Tools Command Prompt for VS」窗口里执行**——那里才有 C 编译器环境，否则训练时会报 `Failed to find C compiler`。
 
 ## 5. 安装 PyTorch（必须 cu128 版）
 
@@ -174,7 +187,8 @@ print(tok.decode(m.generate(ids, max_new_tokens=256)[0][ids.shape[1]:], skip_spe
 | 现象                             | 原因                       | 解决                                                                          |
 | ------------------------------ | ------------------------ | --------------------------------------------------------------------------- |
 | `no kernel image is available` | PyTorch 装成了 CPU 版或 cu126 | 重装第 5 步的 cu128 版                                                            |
-| `Failed to find C compiler`    | 缺 C 编译器                  | 回到第 2 步装生成工具，并用 x64 原生工具命令提示符运行                                             |
+| `Failed to find C compiler`    | 缺 C 编译器                  | 回到第 2 步装生成工具；并确认 Python 是从「x64 Native Tools Command Prompt for VS」里启动的      |
+| 普通 cmd 里敲 `cl` 提示"不是内部或外部命令"   | MSVC 不写入系统 PATH，属正常现象     | 见第 2 步验证：改用「x64 Native Tools Command Prompt for VS」，或先执行一次 `VsDevCmd.bat` |
 | `CUDA out of memory`           | 显存不足                     | 降 `max_seq_length`，确保 `load_in_4bit=True`                                   |
 | Unsloth 提示不支持 `qwen3_5` 架构     | 框架还没跟上新架构                | 改用 `transformers + peft + trl` 标准 QLoRA，或换 Qwen3-4B-Instruct-2507（老架构，生态成熟） |
 | 解包 DLL 失败                      | 缺运行库                     | 回到第 3 步                                                                     |
