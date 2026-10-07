@@ -33,10 +33,33 @@ nvidia-smi
 
 ## 2. 安装 Visual Studio 生成工具 2022
 
-- 地址：<https://visualstudio.microsoft.com/visual-cpp-build-tools/>
-- 下载"生成工具"，安装时勾选 **使用 C++ 的桌面开发**（约 3–6GB）。
+本机现状（2026-10-07 实测）：**未安装**，也没有 `cl.exe`。
+
+**VSCode 替代不了这一步。** VSCode 只是编辑器，本身不含编译器；插件市场里的 C/C++ 插件，官方说明第一段就写了"不包含 C++ 编译器和调试器，需要另行安装"。两个名字很像，但不是同一件东西：
+
+| 名称 | 是什么 | 与本项目的关系 |
+| --- | --- | --- |
+| Visual Studio Code（VSCode） | 轻量代码编辑器 | 你已有，用来读代码、看脚本 |
+| Visual Studio 生成工具（Build Tools） | MSVC 编译器 + Windows SDK | 本步要装的 |
+
+装法（本机 winget 1.29 可用，两种任选）：
+
+- **命令行（推荐）**：以**管理员身份**打开 PowerShell，执行
+
+  ```bat
+  winget install --id Microsoft.VisualStudio.2022.BuildTools -e
+  ```
+
+  弹出安装界面后勾选 **使用 C++ 的桌面开发**，并确认右侧包含 `MSVC v143 ... 生成工具` 与 `Windows 10/11 SDK`。
+- **官网下载**：<https://visualstudio.microsoft.com/visual-cpp-build-tools/>，同样勾选 **使用 C++ 的桌面开发**（约 3–6GB）。
+
+验证：**新开**一个窗口执行 `cl`，看到 `Microsoft (R) C/C++ ...` 的版本信息即成功。
 
 > 为什么需要：加速库 Triton 第一次运行要现场编译显卡内核，机器上没有 C 语言编译器就会报 `Failed to find C compiler`。
+>
+> 补充：新版 triton-windows 的轮子已内置一个小型 C 编译器（TinyCC），所以**有可能**不装也能跑；但这条路径未经本项目实测，是网上报错的常见来源。如果这 3–6GB 下载是个负担，可以先跳过，等真的报错再回来装。
+>
+> 另外，在 VSCode 里装 C/C++ 插件是可选的便利项（代码高亮、跳转），它不提供编译器，装了也不能替代本步。
 
 ## 3. 安装 VC++ 运行库
 
