@@ -1,0 +1,115 @@
+{
+  "stages": [
+    {
+      "log": "01-基座推理.log",
+      "command": [
+        ".\\.venv\\Scripts\\python.exe",
+        "-u",
+        "-X",
+        "utf8",
+        "scripts/qwen35_infer.py",
+        "--method",
+        "qlora",
+        "--seq-length",
+        "512",
+        "--max-new-tokens",
+        "96",
+        "--prompt",
+        "做一个电池供电的数据采集器，开始设计前需要确认哪些需求？"
+      ],
+      "started_utc": "2026-10-08T13:31:12.404327+00:00",
+      "exit_code": 0,
+      "ended_utc": "2026-10-08T13:32:19.487437+00:00"
+    },
+    {
+      "log": "02-试训-尝试1.log",
+      "command": [
+        ".\\.venv\\Scripts\\python.exe",
+        "-u",
+        "-X",
+        "utf8",
+        "scripts/qwen35_qlora_smoke.py",
+        "--method",
+        "qlora",
+        "--steps",
+        "10",
+        "--seq-length",
+        "512",
+        "--rank",
+        "8",
+        "--output-dir",
+        "experiments/qlora/checkpoints/chain-20261008-01/attempt-01"
+      ],
+      "started_utc": "2026-10-08T13:32:24.211049+00:00",
+      "exit_code": 0,
+      "ended_utc": "2026-10-08T13:33:54.087293+00:00"
+    },
+    {
+      "log": "03-适配器重载.log",
+      "command": [
+        ".\\.venv\\Scripts\\python.exe",
+        "-u",
+        "-X",
+        "utf8",
+        "scripts/qwen35_infer.py",
+        "--method",
+        "qlora",
+        "--seq-length",
+        "512",
+        "--max-new-tokens",
+        "96",
+        "--prompt",
+        "做一个电池供电的数据采集器，开始设计前需要确认哪些需求？",
+        "--adapter-path",
+        "experiments/qlora/checkpoints/chain-20261008-01/attempt-01/adapter"
+      ],
+      "started_utc": "2026-10-08T13:34:35.328014+00:00",
+      "exit_code": 0,
+      "ended_utc": "2026-10-08T13:35:06.571850+00:00"
+    },
+    {
+      "log": "04-基座推理-短回答.log",
+      "command": [
+        ".\\.venv\\Scripts\\python.exe",
+        "-u",
+        "-X",
+        "utf8",
+        "scripts/qwen35_infer.py",
+        "--method",
+        "qlora",
+        "--seq-length",
+        "512",
+        "--max-new-tokens",
+        "160",
+        "--prompt",
+        "请用一句话列出电池供电数据采集器设计前应确认的需求，不要解释。"
+      ],
+      "started_utc": "2026-10-08T13:37:43.457088+00:00",
+      "exit_code": 0,
+      "ended_utc": "2026-10-08T13:38:06.409644+00:00"
+    },
+    {
+      "log": "05-适配器重载-短回答.log",
+      "command": [
+        ".\\.venv\\Scripts\\python.exe",
+        "-u",
+        "-X",
+        "utf8",
+        "scripts/qwen35_infer.py",
+        "--method",
+        "qlora",
+        "--seq-length",
+        "512",
+        "--max-new-tokens",
+        "160",
+        "--prompt",
+        "请用一句话列出电池供电数据采集器设计前应确认的需求，不要解释。",
+        "--adapter-path",
+        "experiments/qlora/checkpoints/chain-20261008-01/attempt-01/adapter"
+      ],
+      "started_utc": "2026-10-08T13:38:14.036677+00:00",
+      "exit_code": 0,
+      "ended_utc": "2026-10-08T13:38:39.263352+00:00"
+    }
+  ]
+}

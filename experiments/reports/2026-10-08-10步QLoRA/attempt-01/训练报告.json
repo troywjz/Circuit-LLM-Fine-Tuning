@@ -1,0 +1,27 @@
+{
+  "result_type": "environment_smoke_test",
+  "method": "qlora",
+  "created_utc": "2026-10-08T13:33:52.411633+00:00",
+  "model_path": "D:\\models\\Qwen3.5-4B",
+  "configured_max_length": 512,
+  "sample_max_tokens": 43,
+  "sample_count": 8,
+  "rank": 8,
+  "requested_steps": 10,
+  "global_step": 10,
+  "train_loss": 2.2590954184532164,
+  "seed": 3407,
+  "package_versions": {
+    "torch": "2.14.1+cu130",
+    "transformers": "5.17.0",
+    "unsloth": "2026.10.2",
+    "unsloth_zoo": "2026.10.2",
+    "trl": "1.13.0",
+    "peft": "0.21.2",
+    "bitsandbytes": "0.50.2"
+  },
+  "gpu_name": "NVIDIA GeForce RTX 5060 Ti",
+  "peak_allocated_GiB": 3.282,
+  "peak_reserved_GiB": 3.482,
+  "limitations": "短玩具对话只用于环境冒烟检查；不是真实训练集或Benchmark，不证明电路能力提升，也不证明配置长度稳定性。"
+}

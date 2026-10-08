@@ -9,3 +9,4 @@ __pycache__/
 # 数据与实验产物（体积大，后续按需改用 Release/云盘分发）
 data/raw/
 experiments/**/checkpoints/
+unsloth_compiled_cache/
