@@ -6,10 +6,42 @@ Unsloth 加载参数，避免两个入口各自形成略有差异的加载逻辑
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
-DEFAULT_MODEL_PATH = Path(r"D:\models\Qwen3.5-4B")
+# 项目根目录由本文件位置确定，避免从其他工作目录启动时解析到错误位置。
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _default_model_path() -> Path:
+    """按环境变量、本机私有配置、项目内通用目录的顺序选择模型路径。"""
+    # 环境变量可覆盖本机配置；相对路径也固定相对项目根目录解释。
+    env_path = os.environ.get("CIRCUIT_MODEL_PATH", "").strip()
+    if env_path:
+        path = Path(env_path).expanduser()
+        return (PROJECT_ROOT / path).resolve() if not path.is_absolute() else path.resolve()
+
+    # 私有配置只读取 JSON 数据，不导入或执行其中的任何内容。
+    config_path = PROJECT_ROOT / "本地资料" / "本地配置.json"
+    if config_path.exists():
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"本机模型配置不可读或不是有效 JSON：{config_path}\n{exc}") from exc
+        if not isinstance(config, dict):
+            raise SystemExit(f"本机模型配置必须是 JSON 对象：{config_path}")
+        value = config.get("model_path")
+        if not isinstance(value, str) or not value.strip():
+            raise SystemExit(f"本机模型配置的 model_path 必须是非空路径字符串：{config_path}")
+        path = Path(value.strip()).expanduser()
+        return (PROJECT_ROOT / path).resolve() if not path.is_absolute() else path.resolve()
+
+    # 无私有配置时使用仓库内通用位置，不包含个人机器信息。
+    return PROJECT_ROOT / "models" / "Qwen3.5-4B"
+
+
+DEFAULT_MODEL_PATH = _default_model_path()
 
 
 def require_local_model(model_path: Path) -> None:
