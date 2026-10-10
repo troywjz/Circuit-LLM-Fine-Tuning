@@ -328,7 +328,9 @@ def call_teacher(config: TeacherConfig, system_prompt: str, user_prompt: str) ->
         encoded = json.dumps(body, ensure_ascii=False).encode("utf-8")
     except (TypeError, ValueError, UnicodeError):
         raise TeacherError("教师接口请求配置无法编码为 JSON。") from None
-    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    # 使用项目标识供网关识别请求，避免默认 Python-urllib 特征导致兼容拒绝。
+    headers = {"Content-Type": "application/json", "Accept": "application/json",
+               "User-Agent": "CircuitLLM/0.1"}
     if config.provider == "anthropic":
         headers.update({"x-api-key": config.api_key, "anthropic-version": "2023-06-01"})
     else:
