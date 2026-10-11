@@ -18,6 +18,13 @@ from urllib.parse import urlsplit, urlunsplit
 class TeacherError(Exception):
     """对外安全的教师接口错误，不包含凭据或响应正文。"""
 
+    def __init__(self, message: str, *, http_status: int | None = None,
+                 category: str | None = None, retry_after_seconds: float | None = None):
+        super().__init__(message)
+        self.http_status = http_status
+        self.category = category
+        self.retry_after_seconds = retry_after_seconds
+
 
 @dataclass
 class TeacherConfig:
@@ -41,6 +48,53 @@ _PROTECTED_EXTRA = {
     "model", "messages", "input", "instructions", "system", "stream",
     "max_tokens", "max_completion_tokens", "max_output_tokens",
 }
+
+
+def _classify_http_error(exc: urllib.error.HTTPError) -> TeacherError:
+    """有限读取错误正文，仅用关键词分类；所有返回字段固定且不含服务端原文。"""
+    try:
+        raw = exc.read(16 * 1024)
+    except Exception:
+        raw = b""
+    category = "unknown"
+    try:
+        parsed = json.loads(raw.decode("utf-8", errors="replace")) if raw else None
+        item = parsed.get("error", parsed) if isinstance(parsed, dict) else None
+        fragments: list[str] = []
+        if isinstance(item, dict):
+            for name in ("code", "type", "message"):
+                value = item.get(name)
+                if isinstance(value, str):
+                    fragments.append(value.lower())
+        detail = " ".join(fragments)
+        if any(word in detail for word in ("insufficient_quota", "quota", "billing", "credit balance", "payment required", "hard limit")):
+            category = "quota_billing"
+        elif any(word in detail for word in ("invalid_api_key", "authentication", "unauthorized", "invalid x-api-key", "permission denied")):
+            category = "auth"
+        elif any(word in detail for word in ("rate_limit", "rate limit", "too many requests", "requests per minute", "tokens per minute")):
+            category = "rate_limit"
+    except (TypeError, ValueError, UnicodeError):
+        pass
+    if category == "unknown" and exc.code in {401, 403}:
+        category = "auth"
+    retry_after = None
+    if exc.code == 429 and exc.headers is not None:
+        try:
+            value = exc.headers.get("Retry-After")
+            numeric = float(value) if value is not None else None
+            if numeric is not None and math.isfinite(numeric) and numeric >= 0:
+                retry_after = min(numeric, 300.0)
+        except (TypeError, ValueError, OverflowError):
+            pass
+    labels = {
+        "quota_billing": "教师接口额度或账单受限",
+        "auth": "教师接口认证或权限失败",
+        "rate_limit": "教师接口限流",
+        "unknown": "教师接口请求失败",
+    }
+    return TeacherError(f"{labels[category]}（HTTP {exc.code}）。",
+                        http_status=exc.code, category=category,
+                        retry_after_seconds=retry_after)
 
 
 def _safe_url(value: str, name: str, *, allow_empty: bool = False) -> str:
@@ -185,7 +239,9 @@ def _extract(config: TeacherConfig, data: Any) -> dict[str, Any]:
                     and not isinstance(value, bool) and math.isfinite(value)}
         usage = filtered or None
     raw_model = data.get("model")
-    model = raw_model if isinstance(raw_model, str) and raw_model else config.model_id
+    reported_model = raw_model if isinstance(raw_model, str) and raw_model else None
+    # 保留旧 model 字段的请求名回退；新调用方可用 reported_model 精确表示服务返回值。
+    model = reported_model or config.model_id
     raw_id = data.get("id") or data.get("request_id")
     request_id = raw_id if isinstance(raw_id, str) else None
     if config.api_key and any(config.api_key in value for value in (model, request_id or "")):
@@ -285,13 +341,12 @@ def _extract(config: TeacherConfig, data: Any) -> dict[str, Any]:
         raise TeacherError("教师接口未返回最终文本。")
     return {"text": text, "usage": usage,
             "finish_reason": finish, "model": model,
+            "reported_model": reported_model,
             "request_id": str(request_id) if request_id is not None else None}
 
 
-def call_teacher(config: TeacherConfig, system_prompt: str, user_prompt: str) -> dict[str, Any]:
-    """调用一次非 stream 文本接口；错误只包含状态类别，不包含正文。"""
-    if not isinstance(system_prompt, str) or not isinstance(user_prompt, str):
-        raise TeacherError("system_prompt 和 user_prompt 必须是字符串。")
+def _call_teacher_body(config: TeacherConfig, body: dict[str, Any]) -> dict[str, Any]:
+    """共享的安全 HTTP 发送与响应解析。"""
     # 直接构造配置也必须满足数值边界，避免 urllib 收到 NaN 或无穷超时。
     if (not isinstance(config.provider, str) or config.provider not in {"openai", "anthropic"}
             or not isinstance(config.api_key, str)
@@ -304,31 +359,13 @@ def call_teacher(config: TeacherConfig, system_prompt: str, user_prompt: str) ->
             or isinstance(config.max_retries, bool)
             or config.max_retries < 0 or config.max_retries > 2):
         raise TeacherError("timeout 或 retry 数值配置无效。")
-    # 再次校验运行时配置，防止调用方绕过 load_config 直接覆盖保护字段。
     if not isinstance(config.extra_body, dict) or _PROTECTED_EXTRA.intersection(config.extra_body):
         raise TeacherError("extra_body 必须是 object，且不能包含受保护的请求字段。")
     url = endpoint_url(config)
-    if config.provider == "openai" and config.openai_api == "responses":
-        body = {"model": config.model_id, "instructions": system_prompt,
-                "input": user_prompt, "max_output_tokens": config.max_output_tokens,
-                "store": False, "stream": False, **config.extra_body}
-    elif config.provider == "openai":
-        body = {"model": config.model_id,
-                "messages": [{"role": "system", "content": system_prompt},
-                             {"role": "user", "content": user_prompt}],
-                config.openai_max_tokens_field: config.max_output_tokens,
-                "stream": False, **config.extra_body}
-    elif config.provider == "anthropic":
-        body = {"model": config.model_id, "system": system_prompt,
-                "messages": [{"role": "user", "content": user_prompt}],
-                "max_tokens": config.max_output_tokens, **config.extra_body}
-    else:
-        raise TeacherError("未知教师服务协议。")
     try:
         encoded = json.dumps(body, ensure_ascii=False).encode("utf-8")
     except (TypeError, ValueError, UnicodeError):
         raise TeacherError("教师接口请求配置无法编码为 JSON。") from None
-    # 使用项目标识供网关识别请求，避免默认 Python-urllib 特征导致兼容拒绝。
     headers = {"Content-Type": "application/json", "Accept": "application/json",
                "User-Agent": "CircuitLLM/0.1"}
     if config.provider == "anthropic":
@@ -337,7 +374,6 @@ def call_teacher(config: TeacherConfig, system_prompt: str, user_prompt: str) ->
         headers["Authorization"] = "Bearer " + config.api_key
     request = urllib.request.Request(url, data=encoded, headers=headers, method="POST")
     handlers: list[Any] = [_NoRedirect()]
-    # 本地 mock 始终直连，避免无论环境代理还是显式代理都将请求发送到远端代理。
     host = urlsplit(url).hostname or ""
     local_hosts = {"localhost", "127.0.0.1", "::1"}
     if host.lower() in local_hosts:
@@ -354,27 +390,24 @@ def call_teacher(config: TeacherConfig, system_prompt: str, user_prompt: str) ->
             break
         except urllib.error.HTTPError as exc:
             code = exc.code
-            if code in {401, 403, 400}:
-                raise TeacherError(f"教师接口请求失败（HTTP {code}）。") from None
+            classified = _classify_http_error(exc)
+            if code in {401, 403, 400} or (code == 429 and classified.category == "quota_billing"):
+                raise classified from None
             if code == 429 or 500 <= code <= 599:
                 if attempt < config.max_retries:
                     time.sleep(min(2 ** attempt, 10))
                     continue
             if 300 <= code < 400:
                 raise TeacherError("教师接口重定向已拒绝。") from None
-            raise TeacherError(f"教师接口请求失败（HTTP {code}）。") from None
+            raise classified from None
         except (TimeoutError, urllib.error.URLError) as exc:
-            if isinstance(exc, urllib.error.URLError) and not isinstance(exc.reason, TimeoutError):
-                transient = False
-            else:
-                transient = True
+            transient = not isinstance(exc, urllib.error.URLError) or isinstance(exc.reason, TimeoutError)
             if transient and attempt < config.max_retries:
                 time.sleep(min(2 ** attempt, 10))
                 continue
             raise TeacherError("教师接口网络请求失败或超时。") from None
     try:
         response_text = raw.decode("utf-8")
-        # 在解析成功响应前检查完整正文，避免密钥藏在文本或元数据中。
         if config.api_key and config.api_key in response_text:
             raise TeacherError("教师接口响应包含配置密钥，已拒绝处理。")
         data = json.loads(response_text)
@@ -388,3 +421,82 @@ def call_teacher(config: TeacherConfig, system_prompt: str, user_prompt: str) ->
         raise
     except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
         raise TeacherError("教师接口响应结构无效。") from None
+
+
+def call_teacher(config: TeacherConfig, system_prompt: str, user_prompt: str) -> dict[str, Any]:
+    """调用一次非 stream 文本接口；错误只包含状态类别，不包含正文。"""
+    if not isinstance(system_prompt, str) or not isinstance(user_prompt, str):
+        raise TeacherError("system_prompt 和 user_prompt 必须是字符串。")
+    # 再次校验运行时配置，防止调用方绕过 load_config 直接覆盖保护字段。
+    if not isinstance(config.extra_body, dict) or _PROTECTED_EXTRA.intersection(config.extra_body):
+        raise TeacherError("extra_body 必须是 object，且不能包含受保护的请求字段。")
+    if config.provider == "openai" and config.openai_api == "responses":
+        body = {"model": config.model_id, "instructions": system_prompt,
+                "input": user_prompt, "max_output_tokens": config.max_output_tokens,
+                "store": False, "stream": False, **config.extra_body}
+    elif config.provider == "openai":
+        body = {"model": config.model_id,
+                "messages": [{"role": "system", "content": system_prompt},
+                             {"role": "user", "content": user_prompt}],
+                config.openai_max_tokens_field: config.max_output_tokens,
+                "stream": False, **config.extra_body}
+    elif config.provider == "anthropic":
+        body = {"model": config.model_id, "system": system_prompt,
+                "messages": [{"role": "user", "content": user_prompt}],
+                "max_tokens": config.max_output_tokens, **config.extra_body}
+    else:
+        raise TeacherError("未知教师服务协议。")
+    return _call_teacher_body(config, body)
+
+
+def call_teacher_messages(config: TeacherConfig, messages: list[dict[str, str]]) -> dict[str, Any]:
+    """按完整 user/assistant 对话调用；可带首条 system，且必须以 user 结束。"""
+    if (not isinstance(config.provider, str) or config.provider not in {"openai", "anthropic"}
+            or not isinstance(config.openai_api, str)
+            or config.openai_api not in {"responses", "chat_completions"}):
+        raise TeacherError("教师服务协议配置无效。")
+    if not isinstance(config.extra_body, dict) or _PROTECTED_EXTRA.intersection(config.extra_body):
+        raise TeacherError("extra_body 必须是 object，且不能包含受保护的请求字段。")
+    if not isinstance(messages, list) or not messages:
+        raise TeacherError("messages 必须是非空的消息数组。")
+    clean: list[dict[str, str]] = []
+    for i, message in enumerate(messages):
+        if (not isinstance(message, dict) or set(message) != {"role", "content"}
+                or message.get("role") not in {"system", "user", "assistant"}
+                or not isinstance(message.get("content"), str) or not message["content"].strip()):
+            raise TeacherError(f"messages[{i}] 结构无效。")
+        clean.append({"role": message["role"], "content": message["content"]})
+    if clean[0]["role"] == "system":
+        if sum(m["role"] == "system" for m in clean) != 1:
+            raise TeacherError("仅允许首条可选 system 消息。")
+        dialogue = clean[1:]
+    else:
+        dialogue = clean
+    if not dialogue or dialogue[-1]["role"] != "user":
+        raise TeacherError("messages 必须以 user 消息结束。")
+    expected = "user"
+    for msg in dialogue:
+        if msg["role"] != expected:
+            raise TeacherError("user 与 assistant 消息必须交替。")
+        expected = "assistant" if expected == "user" else "user"
+    system = clean[0]["content"] if clean[0]["role"] == "system" else None
+    turns = [{"role": m["role"], "content": m["content"]} for m in dialogue]
+    if config.provider == "openai" and config.openai_api == "responses":
+        body = {"model": config.model_id, "input": turns,
+                "max_output_tokens": config.max_output_tokens, "store": False,
+                "stream": False, **config.extra_body}
+        if system is not None:
+            body["instructions"] = system
+    elif config.provider == "openai":
+        chat = ([{"role": "system", "content": system}] if system is not None else []) + turns
+        body = {"model": config.model_id, "messages": chat,
+                config.openai_max_tokens_field: config.max_output_tokens,
+                "stream": False, **config.extra_body}
+    elif config.provider == "anthropic":
+        body = {"model": config.model_id, "messages": turns,
+                "max_tokens": config.max_output_tokens, **config.extra_body}
+        if system is not None:
+            body["system"] = system
+    else:
+        raise TeacherError("未知教师服务协议。")
+    return _call_teacher_body(config, body)
