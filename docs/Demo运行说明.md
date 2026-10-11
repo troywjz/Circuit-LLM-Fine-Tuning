@@ -10,7 +10,7 @@
 
 首轮数据已审校与编码检查：每条 69–378 tokens，共 7,288 tokens、assistant labels 4,341，无截断。训练文件 SHA-256 为 `e6cfddb55a92342e7f48bbd18f7956a30576da77f9c8074fb94837430bbb68d3`。dev16（12 领域、4 通用）和 final50（40 领域、10 通用）保持冻结，含同任务族参数变体，不能当作独立任务或官方 Benchmark。旧 Base 分数因停句问题暂作诊断，新比较必须统一停止协议。首轮未传中文 validation，以 dev 选检查点。
 
-**SOURCE_FACT**：两轮 60 步训练已完成。已确认并修复回合停句配置，新协议重算中；旧曲线与数字只作诊断，见[修复说明](停句配置修复说明.md)。第二轮混合数据与训练见[修订记录](修订数据与训练记录.md)。
+**SOURCE_FACT**：两轮 60 步训练与修复停句后的开发对照已完成。第二轮 30 步领域提高 5.00 分、通用降低 11.25 分；三个版本均未通过既定门槛，当前只做最终诊断、不推荐部署。见[修订对照](修订开发集对照.md)。旧曲线与数字只作诊断，见[修复说明](停句配置修复说明.md)。第二轮混合数据与训练见[修订记录](修订数据与训练记录.md)。
 
 ## 首轮准备与训练
 
@@ -41,7 +41,7 @@ python scripts/demo_infer.py --cases 本地资料/Demo-V1/评测/dev_inputs.json
 python scripts/demo_eval_tools.py prepare-blind --answers 本地资料/Demo-V1/评测/answers.jsonl --blind 本地资料/Demo-V1/评测/blind.jsonl --mapping 本地资料/Demo-V1/评测/private_mapping.jsonl
 ```
 
-Claude 参照通过当前 API 服务另发独立的 messages 请求，只接收学生材料和该请求自己的历史，不提供 teacher 答案、评分要点或工具。服务使用默认解码，与本地推理配置不同；gateway 返回的模型身份信息不是独立认证。目前完整 API 参照尚未收集。先 dry-run 检查题集：
+Claude 参照通过当前 API 服务另发独立的 messages 请求，只接收学生材料和该请求自己的历史，不提供 teacher 答案、评分要点或工具。服务使用默认解码，与本地推理配置不同；gateway 返回的模型身份信息不是独立认证。开发 16 题和最终 50 题的 API 参照已完整收集，无需重跑。以下仅为使用程序的示例，先 dry-run 检查题集：
 
 ```powershell
 python scripts/demo_api_reference.py --cases 本地资料/Demo-V1/评测/dev_inputs.jsonl --output 本地资料/Demo-V1/评测/claude-opus-5-5.jsonl --env-file .env --model-id claude-opus-5-5 --run-label claude-opus-5-5 --dry-run
