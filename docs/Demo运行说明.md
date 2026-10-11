@@ -10,7 +10,7 @@
 
 首轮数据经过主 Agent 审校和本地 Qwen tokenizer 的 assistant-only 编码检查：每条 69–378 tokens，合计 7,288 tokens，其中 assistant labels 合计 4,341 tokens；全部低于 1,024 上限，无截断。训练文件 SHA-256 为 `e6cfddb55a92342e7f48bbd18f7956a30576da77f9c8074fb94837430bbb68d3`。冻结 dev16（12 条领域、4 条通用）与 final50（40 条领域、10 条通用）保持原样；Base 在 dev16 的领域 baseline 为 47.92、通用为 76.25。题目是项目自编合成诊断场景，含同一任务族参数变体；40 个场景不等于 40 个独立任务，也不是官方 Benchmark。首轮无中文 validation 数据，训练未传 `--validation`，checkpoint 依据冻结 dev16 选择。
 
-**SOURCE_FACT**：首轮新 Base 的 60 步训练已完成，平均 train loss 2.226，峰值 allocated 3.317 GiB；step 15、30、60 与 final adapter 已保存。checkpoint 推理和评分正在进行，当前尚无微调提升结论。更多数据边界见[中文数据首轮记录](中文数据首轮记录.md)。
+**SOURCE_FACT**：首轮 60 步训练及三个检查点的开发对照已完成。step 30 领域均分由 47.92 升至 50.83，但通用均分由 76.25 降至 65.63，尚无稳定的整体提升结论。见[实际曲线](首轮开发集对照.md)和[数据记录](中文数据首轮记录.md)。
 
 ## 首轮准备与训练
 
