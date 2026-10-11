@@ -1,0 +1,11 @@
+﻿model,step,kind,n,mean_score,pass_rate,hard_errors
+Base,,domain,12,47.916666666666664,0.0,11
+Base,,general,4,76.25,75.0,0
+claude-opus-5-5,,domain,12,63.125,33.333333333333336,12
+claude-opus-5-5,,general,4,86.25,75.0,0
+FT-first,15,domain,12,40.0,0.0,9
+FT-first,15,general,4,65.625,50.0,0
+FT-first,30,general,4,65.625,50.0,0
+FT-first,30,domain,12,50.833333333333336,16.666666666666668,8
+FT-first,60,domain,12,43.958333333333336,8.333333333333334,10
+FT-first,60,general,4,69.375,50.0,2
