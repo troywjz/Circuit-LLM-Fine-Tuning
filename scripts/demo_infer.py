@@ -10,7 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from demo_data_utils import DemoDataError
-from qwen35_common import DEFAULT_MODEL_PATH, load_unsloth_model, require_adapter
+from qwen35_common import (CHAT_STOP_POLICY_VERSION, DEFAULT_MODEL_PATH,
+                           effective_chat_stop_ids, load_unsloth_model, require_adapter)
 
 
 def _sha(path: Path) -> str:
@@ -94,8 +95,11 @@ def _run_fingerprint(cases_path: Path, model_path: Path, adapter_path: Path | No
                         "config_sha256": _sha(adapter_path / "adapter_config.json"),
                         "weight_file": weight.name, "weight_sha256": _sha(weight)}
     cases_hash = _sha(cases_path)
+    generation_config = model_path / "generation_config.json"
     payload = {"cases_sha256": cases_hash, "model_path": str(model_path),
                "model_config_sha256": _sha(config_path), "adapter": adapter_meta,
+               "generation_config_sha256": _sha(generation_config) if generation_config.is_file() else None,
+               "stop_policy_version": CHAT_STOP_POLICY_VERSION,
                "run_label": run_label, "step": step, "seq_length": seq_length,
                "max_new_tokens": max_new_tokens, "seed": seed}
     encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
@@ -180,6 +184,7 @@ def main(argv: list[str] | None = None) -> int:
             model = PeftModel.from_pretrained(model, str(adapter), is_trainable=False, local_files_only=True)
         FastLanguageModel.for_inference(model)
         model.eval()
+        stop_ids = effective_chat_stop_ids(model, tokenizer)
         torch.manual_seed(args.seed)
         torch.cuda.manual_seed_all(args.seed)
         for case in pending:
@@ -204,21 +209,25 @@ def main(argv: list[str] | None = None) -> int:
                 start = time.perf_counter()
                 with torch.inference_mode():
                     generated = model.generate(**encoded, max_new_tokens=args.max_new_tokens,
-                                               do_sample=False, use_cache=True)
+                                               do_sample=False, use_cache=True,
+                                               eos_token_id=stop_ids)
                 torch.cuda.synchronize()
                 elapsed = time.perf_counter() - start
                 generated_ids = generated[0, input_tokens:]
                 output_tokens = int(generated_ids.numel())
                 answer = tokenizer.decode(generated_ids, skip_special_tokens=True)
-                eos_ids = model.generation_config.eos_token_id
-                eos_ids = eos_ids if isinstance(eos_ids, list) else [eos_ids]
-                stopped_on_eos = output_tokens > 0 and int(generated_ids[-1]) in eos_ids
+                last_token_id = int(generated_ids[-1]) if output_tokens else None
+                stopped_on_eos = last_token_id in stop_ids
                 hit_limit = output_tokens >= args.max_new_tokens and not stopped_on_eos
                 stop_reason = "max_new_tokens" if hit_limit else "eos_or_stop"
                 finish_reason = "truncated_at_limit" if hit_limit else "completed"
                 # 用户回合已加入，只追加回答；保存的历史与实际模型输入一致。
                 history = _append_turn(history, None, answer)
                 turn_results.append({"user_turn": user_turn, "answer": answer,
+                                     "stop_token_ids": stop_ids,
+                                     "stop_policy_version": CHAT_STOP_POLICY_VERSION,
+                                     "last_token_id": last_token_id,
+                                     "stopped_on_eos": stopped_on_eos,
                                      "input_tokens": input_tokens, "output_tokens": output_tokens,
                                      "latency_seconds": round(elapsed, 4), "finish_reason": finish_reason,
                                      "stop_reason": stop_reason, "truncated": hit_limit,
@@ -232,6 +241,8 @@ def main(argv: list[str] | None = None) -> int:
                       "model": args.run_label, "step": args.step,
                       "adapter_label": "adapter" if adapter else None,
                       "adapter_path_label": adapter.name if adapter else None,
+                      "stop_token_ids": stop_ids,
+                      "stop_policy_version": CHAT_STOP_POLICY_VERSION,
                       "run_fingerprint": fingerprint, "cases_sha256": input_hash,
                       "created_utc": datetime.now(timezone.utc).isoformat(),
                       "answer": "\n\n".join(all_answers), "answers_by_turn": all_answers,

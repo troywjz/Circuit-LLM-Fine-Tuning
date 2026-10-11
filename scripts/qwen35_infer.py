@@ -8,7 +8,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from qwen35_common import DEFAULT_MODEL_PATH, load_unsloth_model, peak_memory_gib, require_adapter
+from qwen35_common import (DEFAULT_MODEL_PATH, effective_chat_stop_ids,
+                           load_unsloth_model, peak_memory_gib, require_adapter)
 
 
 def main() -> int:
@@ -41,6 +42,7 @@ def main() -> int:
     FastLanguageModel.for_inference(model)
     # eval() 让 Dropout 等层进入评估模式；它本身不会关闭梯度计算。
     model.eval()
+    stop_ids = effective_chat_stop_ids(model, tokenizer)
     # 用 chat template 补上模型所需的 user 角色边界；关闭 thinking，并请求词典形式，
     # 这样 input_ids 与 attention_mask 等张量能作为命名参数交给 generate。
     inputs = tokenizer.apply_chat_template(
@@ -68,6 +70,7 @@ def main() -> int:
             max_new_tokens=args.max_new_tokens,  # 最多新生成多少 token，不包含输入长度。
             do_sample=False,  # 每步选最高分的 token，减少随机采样造成的回答差异。
             use_cache=True,  # 缓存已算过的生成状态，避免每写一个 token 都重算整个前文。
+            eos_token_id=stop_ids,  # 同时在助手消息结束、tokenizer EOS 和模型 EOS 处停止。
         )
     # 输出序列前 input_len 个 token 是原输入，裁掉后只展示模型新续写的部分。
     answer = tokenizer.decode(output[0, input_len:], skip_special_tokens=True)

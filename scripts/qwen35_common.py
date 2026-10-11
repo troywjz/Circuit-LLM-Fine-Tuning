@@ -6,6 +6,7 @@ Unsloth 加载参数，避免两个入口各自形成略有差异的加载逻辑
 from __future__ import annotations
 
 import json
+import numbers
 import os
 import sys
 from pathlib import Path
@@ -42,6 +43,54 @@ def _default_model_path() -> Path:
 
 
 DEFAULT_MODEL_PATH = _default_model_path()
+
+# 修改停止 token 协议时递增版本，让 Demo 续跑指纹拒绝混用旧输出。
+CHAT_STOP_POLICY_VERSION = "qwen35-chat-stop-v1"
+
+
+def effective_chat_stop_ids(model, tokenizer) -> list[int]:
+    """汇总有效的聊天停止 token ID，供 generate 显式使用。"""
+    configured = getattr(getattr(model, "generation_config", None), "eos_token_id", None)
+    if configured is None:
+        model_ids = []
+    elif isinstance(configured, (list, tuple)):
+        model_ids = list(configured)
+    else:
+        model_ids = [configured]
+
+    def checked_id(value, source: str) -> int:
+        if isinstance(value, bool) or not isinstance(value, numbers.Integral) or value < 0:
+            raise ValueError(f"{source} 必须是非负整数 token ID：{value!r}")
+        return int(value)
+
+    stop_ids: list[int] = []
+    for token_id in model_ids:
+        token_id = checked_id(token_id, "model.generation_config.eos_token_id")
+        if token_id not in stop_ids:
+            stop_ids.append(token_id)
+
+    tokenizer_eos = getattr(tokenizer, "eos_token_id", None)
+    if tokenizer_eos is not None:
+        tokenizer_eos = checked_id(tokenizer_eos, "tokenizer.eos_token_id")
+        if tokenizer_eos not in stop_ids:
+            stop_ids.append(tokenizer_eos)
+
+    im_end = "<|im_end|>"
+    converter = getattr(tokenizer, "convert_tokens_to_ids", None)
+    vocab_getter = getattr(tokenizer, "get_vocab", None)
+    if not callable(converter) or not callable(vocab_getter):
+        raise ValueError("tokenizer 无法确认 <|im_end|>：缺少 token 转换或词表查询接口")
+    im_end_id = converter(im_end)
+    unknown_id = getattr(tokenizer, "unk_token_id", None)
+    if (im_end_id is None or isinstance(im_end_id, (list, tuple))
+            or (unknown_id is not None and im_end_id == unknown_id)):
+        raise ValueError("tokenizer 未识别 <|im_end|>（返回缺失或 UNK）")
+    im_end_id = checked_id(im_end_id, "tokenizer 的 <|im_end|>")
+    if im_end not in vocab_getter():
+        raise ValueError("tokenizer 词表中缺少 <|im_end|>")
+    if im_end_id not in stop_ids:
+        stop_ids.append(im_end_id)
+    return stop_ids
 
 
 def require_local_model(model_path: Path) -> None:
