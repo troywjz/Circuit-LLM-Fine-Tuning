@@ -165,22 +165,50 @@ def plot(aggregate_path: Path, loss_path: Path, out_prefix: Path, note: str) -> 
                          "n": len({r["case_id"] for r in cases}), "mean_score": mean,
                          "pass_rate": 100 * sum(bool(r["pass"]) for r in cases) / len(cases),
                          "hard_errors": sum(len(r.get("hard_errors", [])) for r in cases)})
-        if kind != "domain":
+    domain_rows = [r for r in csv_rows if r["kind"] == "domain"]
+    references = {"base": [], "claude-opus-5-5": []}
+    ft_runs: dict[str, list[tuple[float, dict[str, Any]]]] = {}
+    other_points = []
+    for row in domain_rows:
+        model, step = row["model"], row["step"]
+        lowered = model.lower()
+        if lowered in references:
+            references[lowered].append(row)
             continue
         try:
             x = float(step) if step else None
         except ValueError:
             x = None
-        is_ref = model.lower() in ("base", "claude-opus-5-5")
-        label = "Claude Opus 5.5 (API reference)" if model.lower() == "claude-opus-5-5" else model
-        label += f" (n={len({r['case_id'] for r in cases})})"
-        if is_ref:
-            ax.axhline(mean, linestyle="--", label=label)
-        elif x is not None:
-            ax.scatter([x], [mean], label=f"{model}, step {step} (n={len({r['case_id'] for r in cases})})")
-    ft = sorted((float(r["step"]), float(r["mean_score"])) for r in csv_rows if r["kind"] == "domain" and r["step"] and r["model"].lower().startswith("ft") and str(r["step"]).replace(".", "", 1).isdigit())
-    if ft:
-        ax.plot([x[0] for x in ft], [x[1] for x in ft], marker="o", label="FT observed checkpoints")
+        if x is None:
+            continue
+        if lowered.startswith("ft"):
+            ft_runs.setdefault(model, []).append((x, row))
+        else:
+            other_points.append((model, x, row))
+
+    # Base 与 Claude 使用固定样式，便于黑白打印和跨图识别。
+    for key, color, linestyle, label in (
+        ("base", "#777777", "--", "Base"),
+        ("claude-opus-5-5", "#7B2CBF", "-.", "Claude Opus 5.5 (API reference)"),
+    ):
+        rows_for_ref = references[key]
+        if rows_for_ref:
+            # 参照只能来自一次完整运行，不把多个设置的分数平均成一条线。
+            if len(rows_for_ref) != 1:
+                raise ValueError(f"{key} has multiple reference runs; use one matched setting per figure")
+            ref_mean = float(rows_for_ref[0]["mean_score"])
+            n = int(rows_for_ref[0]["n"])
+            ax.axhline(ref_mean, color=color, linestyle=linestyle, label=f"{label} (n={n})")
+
+    # 每个 FT 模型单独排序、连线和标注，不把不同运行混成一条曲线。
+    for model, points in sorted(ft_runs.items()):
+        points.sort(key=lambda item: item[0])
+        n = max(int(row["n"]) for _, row in points)
+        ax.plot([x for x, _ in points], [float(row["mean_score"]) for _, row in points],
+                marker="o", label=f"{model} (n={n})")
+    for model, x, row in other_points:
+        ax.scatter([x], [float(row["mean_score"])],
+                   label=f"{model}, step {row['step']} (n={row['n']})")
     ax.set(title="Development domain score by model / observed training step", xlabel="Training steps (only recorded checkpoints)", ylabel="Mean score (0–100)", ylim=(0, 100))
     ax.grid(alpha=.25); ax.legend(fontsize=8)
     losses = []
@@ -195,7 +223,8 @@ def plot(aggregate_path: Path, loss_path: Path, out_prefix: Path, note: str) -> 
     loss_ax.plot([x for x, _ in losses], [y for _, y in losses], marker=".")
     loss_ax.set(title="Training loss (optimization signal, not capability)", xlabel="Training steps", ylabel="Recorded loss")
     loss_ax.grid(alpha=.25)
-    fig.suptitle(f"Demo V1 · {note} · Claude Opus 5.5 is an independent request in the same API environment")
+    claude_status = "Claude Opus 5.5 API reference: collected" if references["claude-opus-5-5"] else "Claude Opus 5.5 API reference: not collected"
+    fig.suptitle(f"Demo V1 · {note.strip()}\n{claude_status}")
     out_prefix.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_prefix.with_suffix(".png"), dpi=160)
     fig.savefig(out_prefix.with_suffix(".svg"))
