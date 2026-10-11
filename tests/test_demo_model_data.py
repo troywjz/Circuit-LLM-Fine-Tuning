@@ -14,7 +14,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from demo_data_utils import DemoDataError, read_jsonl, tokenize_assistant_only
 from demo_infer import _append_turn, _load_existing_output, _read_cases, _run_fingerprint
 import demo_infer
-from qwen35_common import DEFAULT_MODEL_PATH
+from qwen35_common import DEFAULT_MODEL_PATH, effective_chat_stop_ids
 
 
 class DemoModelDataTests(unittest.TestCase):
@@ -29,6 +29,70 @@ class DemoModelDataTests(unittest.TestCase):
             except (ImportError, OSError) as exc:
                 self.skipTest(f"本地tokenizer不可用：{exc}")
         return self.__class__._tokenizer
+
+    def test_effective_chat_stop_ids_adds_tokenizer_and_chat_eos(self):
+        class Tokenizer:
+            eos_token_id = 11
+            unk_token_id = 0
+            def convert_tokens_to_ids(self, token):
+                return {"<|im_end|>": 12}.get(token, 0)
+            def get_vocab(self):
+                return {"<|im_end|>": 12}
+
+        model = SimpleNamespace(generation_config=SimpleNamespace(eos_token_id=10))
+        self.assertEqual(effective_chat_stop_ids(model, Tokenizer()), [10, 11, 12])
+
+    def test_effective_chat_stop_ids_deduplicates_complete_eos_set(self):
+        class Tokenizer:
+            eos_token_id = 12
+            unk_token_id = 0
+            def convert_tokens_to_ids(self, token):
+                return 12
+            def get_vocab(self):
+                return {"<|im_end|>": 12}
+
+        model = SimpleNamespace(generation_config=SimpleNamespace(eos_token_id=(12, 10, 12)))
+        self.assertEqual(effective_chat_stop_ids(model, Tokenizer()), [12, 10])
+
+    def test_effective_chat_stop_ids_rejects_missing_chat_eos_and_bad_ids(self):
+        class MissingChatEos:
+            eos_token_id = 11
+            unk_token_id = 0
+            def convert_tokens_to_ids(self, _token):
+                return 0
+            def get_vocab(self):
+                return {}
+
+        class Tokenizer(MissingChatEos):
+            def convert_tokens_to_ids(self, _token):
+                return 12
+            def get_vocab(self):
+                return {"<|im_end|>": 12}
+
+        with self.assertRaisesRegex(ValueError, "未识别"):
+            effective_chat_stop_ids(SimpleNamespace(generation_config=SimpleNamespace(eos_token_id=1)), MissingChatEos())
+        for bad_id in (True, -1, "12", 1.5):
+            with self.subTest(bad_id=bad_id), self.assertRaisesRegex(ValueError, "非负整数"):
+                effective_chat_stop_ids(SimpleNamespace(generation_config=SimpleNamespace(eos_token_id=bad_id)), Tokenizer())
+
+    def test_fingerprint_changes_with_stop_protocol_or_local_generation_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cases = root / "cases.jsonl"
+            cases.write_text("{}\n", encoding="utf-8")
+            model = root / "model"
+            model.mkdir()
+            (model / "config.json").write_text("{}", encoding="utf-8")
+            args = (cases, model, None, "Base", 0, 4096, 1024, 3407)
+            baseline, _ = _run_fingerprint(*args)
+            with patch.object(demo_infer, "CHAT_STOP_POLICY_VERSION", "qwen35-chat-stop-next"):
+                self.assertNotEqual(_run_fingerprint(*args)[0], baseline)
+            generation_config = model / "generation_config.json"
+            generation_config.write_text('{"eos_token_id": [1, 2]}', encoding="utf-8")
+            configured, _ = _run_fingerprint(*args)
+            self.assertNotEqual(configured, baseline)
+            generation_config.write_text('{"eos_token_id": [1, 3]}', encoding="utf-8")
+            self.assertNotEqual(_run_fingerprint(*args)[0], configured)
 
     def test_single_turn_masks_user_and_supervises_answer_and_eos(self):
         tokenizer = self.get_tokenizer()
@@ -133,18 +197,20 @@ class DemoModelDataTests(unittest.TestCase):
 
     def test_main_sends_user_correction_once_and_saves_the_same_history(self):
         class FakeIds:
-            def __init__(self, index):
-                self.index = index
+            def __init__(self, count, last):
+                self.count = count
+                self.last = last
             def numel(self):
-                return 2
+                return self.count
             def __getitem__(self, key):
-                return 2 if key == -1 else 1
+                return self.last if key == -1 else 1
 
         class FakeGenerated:
-            def __init__(self, tokenizer):
-                self.tokenizer = tokenizer
+            def __init__(self, count, last):
+                self.count = count
+                self.last = last
             def __getitem__(self, key):
-                return FakeIds(self.tokenizer.generation_index - 1)
+                return FakeIds(self.count, self.last)
 
         class FakeTensor:
             def __init__(self, count):
@@ -157,6 +223,12 @@ class DemoModelDataTests(unittest.TestCase):
                 self.histories = []
                 self.generation_index = 0
                 self.answers = ["先按一般负载估算。", "已按3.3V约束调整，改用对应电源轨。"]
+                self.eos_token_id = 11
+                self.unk_token_id = 0
+            def convert_tokens_to_ids(self, token):
+                return {"<|im_end|>": 12}.get(token, 0)
+            def get_vocab(self):
+                return {"<|im_end|>": 12}
             def apply_chat_template(self, messages, **_kwargs):
                 self.histories.append(json.loads(json.dumps(messages, ensure_ascii=False)))
                 return {"input_ids": FakeTensor(len(json.dumps(messages, ensure_ascii=False)))}
@@ -166,12 +238,17 @@ class DemoModelDataTests(unittest.TestCase):
         tokenizer = FakeTokenizer()
         class FakeModel:
             device = "cpu"
-            generation_config = SimpleNamespace(eos_token_id=2)
+            generation_config = SimpleNamespace(eos_token_id=10)
+            generation_stop_ids = []
             def eval(self):
                 return self
-            def generate(self, **_kwargs):
+            def generate(self, **kwargs):
+                self.generation_stop_ids.append(kwargs["eos_token_id"])
                 tokenizer.generation_index += 1
-                return FakeGenerated(tokenizer)
+                # 没有 <|im_end|> 停止 ID 时，模拟生成器继续写出 user 角色 token。
+                if 12 in kwargs["eos_token_id"]:
+                    return FakeGenerated(1, 12)
+                return FakeGenerated(2, 90)
 
         fake_torch = SimpleNamespace(
             manual_seed=lambda _seed: None,
@@ -200,11 +277,12 @@ class DemoModelDataTests(unittest.TestCase):
                     "scoring": {"gold": "不可进入模型"}}
             cases_path.write_text(json.dumps(case, ensure_ascii=False) + "\n", encoding="utf-8")
             output_path = root / "answers.jsonl"
+            model = FakeModel()
             with patch.dict(sys.modules, {"unsloth": fake_unsloth, "torch": fake_torch}), \
                  patch.object(demo_infer, "load_unsloth_model",
-                              return_value=(FakeFastLanguageModel, FakeModel(), tokenizer, fake_torch)):
+                              return_value=(FakeFastLanguageModel, model, tokenizer, fake_torch)):
                 result = demo_infer.main(["--cases", str(cases_path), "--output", str(output_path),
-                    "--model-path", str(model_dir), "--seq-length", "2048", "--max-new-tokens", "8"])
+                    "--model-path", str(model_dir), "--seq-length", "2048", "--max-new-tokens", "1"])
             self.assertEqual(result, 0)
             self.assertEqual(len(tokenizer.histories), 2)
             correction = "更正：输入必须兼容3.3V，请按此更新方案。"
@@ -215,6 +293,18 @@ class DemoModelDataTests(unittest.TestCase):
                 {"role": "assistant", "content": "已按3.3V约束调整，改用对应电源轨。"}])
             self.assertEqual(saved["full_dialogue"].count({"role": "user", "content": correction}), 1)
             self.assertIn("3.3V约束", saved["answers_by_turn"][1])
+            expected_stops = [10, 11, 12]
+            self.assertEqual(model.generation_stop_ids, [expected_stops, expected_stops])
+            self.assertEqual(saved["stop_token_ids"], expected_stops)
+            self.assertEqual(saved["stop_policy_version"], demo_infer.CHAT_STOP_POLICY_VERSION)
+            self.assertTrue(all(turn["stop_token_ids"] == expected_stops for turn in saved["turns"]))
+            self.assertTrue(all(turn["stop_policy_version"] == demo_infer.CHAT_STOP_POLICY_VERSION
+                                for turn in saved["turns"]))
+            self.assertTrue(all(turn["finish_reason"] == "completed" and not turn["truncated"]
+                                for turn in saved["turns"]))
+            self.assertTrue(all(turn["output_tokens"] == 1 for turn in saved["turns"]))
+            self.assertTrue(all(turn["last_token_id"] == 12 and turn["stopped_on_eos"]
+                                for turn in saved["turns"]))
 
 
 if __name__ == "__main__":
