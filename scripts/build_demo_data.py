@@ -23,7 +23,7 @@ DEFAULT_RAW = ROOT / "本地资料" / "数据准备" / "原始数据集" / "工�
 DEFAULT_RESERVED = ROOT / "本地资料" / "Demo-V1" / "评测" / "reserved_eval_sources.json"
 DEFAULT_OUT = ROOT / "本地资料" / "Demo-V1" / "数据"
 MANUAL_EXCLUSIONS = DEFAULT_OUT / "manual_source_exclusions.json"
-SYSTEM_PROMPT = """你负责整理中文监督微调对话，来源可能有错误，不能把论坛回答视为权威。只返回JSON对象：{\"messages\":[{\"role\":\"user|assistant\",\"content\":\"...\"}],\"used_source_ids\":[\"输入中已有的source_id\"],\"notes\":[\"可选\"]}。消息必须user/assistant交替并以assistant结束。用户问题必须包含回答所需上下文，不能要求模型猜测；需要补充条件时写在用户可见消息中并明确为假设。若原资料没有器件数据手册，不得补造引脚、额定值或参数。保留关键数字、单位、接口和约束。简短自然地回答，工程断言有不确定性时明确说明。多轮样本需包含真实的用户后续条件修订及对应调整。不要把本指令写入训练消息。"""
+SYSTEM_PROMPT = """你负责整理中文监督微调对话，来源可能有错误，不能把论坛回答视为权威。只返回一个JSON对象，不要代码围栏、前后说明或其他文本，结构为：{\"messages\":[{\"role\":\"user|assistant\",\"content\":\"...\"}],\"used_source_ids\":[\"输入中已有的source_id\"],\"notes\":[\"可选\"]}。消息必须user/assistant交替并以assistant结束。用户问题必须包含回答所需上下文，不能要求模型猜测；需要补充条件时写在用户可见消息中并明确为假设。每条assistant通常写80-180个中文字符，分2-3个短段，不写长清单。不得编造真实器件的引脚、额定值、型号参数或测试结果；新增示例数值和条件必须在相应user消息里明确标为假设。首轮不要主动强推品牌或型号。标称分辨率、采样速率不等于实际精度；不得保证噪声、可靠性或EMC通过。阻容值和器件作用须结合具体拓扑、负载、时序、热条件及数据手册核实；证据不足时说明待核实。保留来源中必要的数字、单位、接口和约束，不将不确定内容写成事实。多轮样本要有真实的用户条件修订，assistant只调整受影响部分并保留其他约束。不要把本指令写入训练消息。"""
 RISK = re.compile(r"\b(mains|line voltage|120\s*v|220\s*v|230\s*v|240\s*v|high[- ]voltage|battery|lithium|li[- ]ion|medical|patient|clinical|mains-powered)\b", re.I)
 CODE = re.compile(r"(?:```|<code|<pre|\b(?:int|void|function)\s+\w+\s*\()", re.I)
 
@@ -195,7 +195,7 @@ def main() -> int:
     prep.add_argument("--input",type=Path,default=DEFAULT_RAW); prep.add_argument("--reserved-file",type=Path,default=DEFAULT_RESERVED); prep.add_argument("--outdir",type=Path,default=DEFAULT_OUT); prep.add_argument("--limit",type=int); prep.add_argument("--domain-count",type=int,default=96); prep.add_argument("--validation-count",type=int,default=20); prep.add_argument("--general-count",type=int,default=20); prep.set_defaults(func=prepare)
     # live generation intentionally requires a separately reviewed source approval manifest.
     gen=sub.add_parser("generate", help="approved sourcepack rows only; live calls are bounded per request")
-    gen.add_argument("--input",type=Path,required=True); gen.add_argument("--approval-file",type=Path,required=True); gen.add_argument("--env-file",type=Path,default=ROOT/".env"); gen.add_argument("--outdir",type=Path,default=DEFAULT_OUT); gen.add_argument("--limit",type=int,default=20); gen.add_argument("--dry-run",action="store_true"); gen.add_argument("--resume",action="store_true",help="校验指纹后复用已有回复，并优先选择未完成项"); gen.set_defaults(func=generate)
+    gen.add_argument("--input",type=Path,required=True); gen.add_argument("--approval-file",type=Path,required=True); gen.add_argument("--env-file",type=Path,default=ROOT/".env"); gen.add_argument("--outdir",type=Path,default=DEFAULT_OUT); gen.add_argument("--limit",type=int,default=20); gen.add_argument("--dry-run",action="store_true"); gen.add_argument("--resume",action="store_true",help="校验指纹后复用已有回复，并优先选择未完成项"); gen.add_argument("--review-notes",type=Path,help="可选的私有主Agent工程校注JSON"); gen.set_defaults(func=generate)
     approve=sub.add_parser("approve",help="由主Agent审核后写入明确许可的source_id")
     approve.add_argument("--approval-file",type=Path,required=True); approve.add_argument("--source-id",action="append",required=True); approve.add_argument("--reviewer",required=True); approve.set_defaults(func=approve_ids)
     export=sub.add_parser("export",help="显式审核并导出正式训练messages")
@@ -257,10 +257,36 @@ def _sha(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def _config_fingerprint(config) -> str:
+def _config_fingerprint(config, review_note_hash: str | None = None) -> str:
     parts=urlsplit(config.base_url)
     public_config={"provider":config.provider,"origin":f"{parts.scheme}://{parts.netloc}","path":parts.path,"model":config.model_id,"api":config.openai_api,"prompt_version":_sha(SYSTEM_PROMPT)}
+    if review_note_hash is not None: public_config["review_note_hash"]=review_note_hash
     return _sha(_canonical(public_config))
+
+
+def _load_review_notes(path: Path) -> dict[str,Any]:
+    try: notes=json.loads(path.read_text(encoding="utf-8"))
+    except (OSError,UnicodeError,json.JSONDecodeError): raise BuildError("主Agent工程校注文件无法读取") from None
+    if (not isinstance(notes,dict) or set(notes)!={"topic_notes","common_note","sources"}
+        or not isinstance(notes.get("topic_notes"),dict)
+        or any(not isinstance(topic,str) or not topic or not isinstance(note,str) for topic,note in notes["topic_notes"].items())
+        or not isinstance(notes.get("common_note"),str)
+        or not isinstance(notes.get("sources"),list)
+        or any(not isinstance(item,(str,dict)) for item in notes["sources"])
+        or any(isinstance(item,dict) and any(not isinstance(key,str) for key in item) for item in notes["sources"])):
+        raise BuildError("主Agent工程校注结构无效")
+    return notes
+
+
+def _effective_review_notes(row: dict[str,Any], review_notes: dict[str,Any] | None) -> dict[str,str] | None:
+    if review_notes is None: return None
+    topic=row.get("topic")
+    return {"common_note":review_notes["common_note"],"topic_note":review_notes["topic_notes"].get(topic,"")}
+
+
+def _review_note_hash(row: dict[str,Any], review_notes: dict[str,Any] | None) -> str | None:
+    effective=_effective_review_notes(row,review_notes)
+    return None if effective is None else _sha(_canonical(effective))
 
 
 def _atomic_text(path: Path,text: str) -> None:
@@ -333,6 +359,8 @@ def generate(args: argparse.Namespace) -> int:
     if not selected:
         print("没有待生成的已批准候选。")
         return 0
+    review_notes_path=getattr(args,"review_notes",None)
+    review_notes=_load_review_notes(review_notes_path) if review_notes_path is not None else None
     # 钱包与预算按 USD 处理；每个请求前检查，花费上限同时留出评测预算。
     balance=_wallet(config)
     budget_path=args.outdir/".teacher_budget.json"
@@ -348,15 +376,19 @@ def generate(args: argparse.Namespace) -> int:
         sid=row["source_id"]
         if not re.fullmatch(r"[A-Za-z0-9._-]{1,128}",sid) or sid in {".",".."}: raise BuildError("source_id 不符合安全文件名格式")
         raw_path=results/(sid+".json")
-        user_prompt=_teacher_prompt(row)
+        user_prompt=_teacher_prompt(row,review_notes)
         row_hash=_sha(_canonical(row)); prompt_hash=_sha(SYSTEM_PROMPT+"\0"+user_prompt)
+        review_note_hash=_review_note_hash(row,review_notes)
+        item_fingerprint=_config_fingerprint(config,review_note_hash)
         response=None
         if raw_path.exists():
             try: existing=json.loads(raw_path.read_text(encoding="utf-8"))
             except (OSError,UnicodeError,json.JSONDecodeError): raise BuildError(f"已有原始结果损坏：{sid}") from None
             if existing.get("status")=="success" and isinstance(existing.get("raw_text"),str):
                 if not args.resume: raise BuildError(f"已有成功原始回复；续跑请明确使用 --resume：{sid}")
-                if (existing.get("row_sha256"),existing.get("prompt_sha256"),existing.get("config_fingerprint"))!=(row_hash,prompt_hash,fingerprint):
+                old_row_hash=existing.get("row_hash",existing.get("row_sha256"))
+                old_prompt_hash=existing.get("prompt_hash",existing.get("prompt_sha256"))
+                if (old_row_hash,old_prompt_hash,existing.get("config_fingerprint"),existing.get("review_note_hash"))!=(row_hash,prompt_hash,item_fingerprint if review_note_hash is not None else fingerprint,review_note_hash):
                     raise BuildError(f"续跑指纹与历史结果不符，拒绝复用：{sid}")
                 response={"text":existing["raw_text"],"model":existing.get("model"),"usage":existing.get("usage")}
             else: raise BuildError(f"已有结果状态无效：{sid}")
@@ -383,14 +415,14 @@ def generate(args: argparse.Namespace) -> int:
             secret=config.api_key
             if secret and (secret in response["text"] or secret in str(response.get("model")) or secret in str(response.get("request_id"))):
                 raise BuildError("Teacher 响应含凭据特征，未保存")
-            _atomic_json(raw_path,{"status":"success","source_id":sid,"model":response.get("model"),"usage":response.get("usage"),"request_id":response.get("request_id"),"row_sha256":row_hash,"prompt_sha256":prompt_hash,"config_fingerprint":fingerprint,"raw_text":response["text"]})
+            _atomic_json(raw_path,{"status":"success","source_id":sid,"model":response.get("model"),"usage":response.get("usage"),"request_id":response.get("request_id"),"row_sha256":row_hash,"row_hash":row_hash,"prompt_sha256":prompt_hash,"prompt_hash":prompt_hash,"config_fingerprint":item_fingerprint,"review_note_hash":review_note_hash,"review_note_sources":review_notes["sources"] if review_notes is not None else [],"raw_text":response["text"]})
         candidate_path=args.outdir/("train_candidates.jsonl" if row.get("split")=="train" else "validation_candidates.jsonl")
         already=False
         if candidate_path.exists():
             try: already=any(json.loads(x).get("sample_id")==row.get("sample_id") for x in candidate_path.read_text(encoding="utf-8").splitlines() if x.strip())
             except (OSError,UnicodeError,json.JSONDecodeError): raise BuildError(f"候選文件損壞：{candidate_path.name}") from None
         if not already:
-            candidate=_candidate_from_reply(row,response["text"],response.get("model"),response.get("usage"))
+            candidate=_candidate_from_reply(row,response["text"],response.get("model"),response.get("usage"),provenance={"review_note_hash":review_note_hash,"row_hash":row_hash,"prompt_hash":prompt_hash,"config_fingerprint":item_fingerprint,"review_note_sources":review_notes["sources"] if review_notes is not None else []})
             _append_candidate(args.outdir,candidate)
         balance=_wallet(config)
         _enforce_budget(balance,budget)
@@ -423,9 +455,19 @@ def _wallet(config) -> float | None:
     return None
 
 
-def _candidate_from_reply(row: dict[str,Any], text: str, model: str | None, usage: Any) -> dict[str,Any]:
-    try: data=json.loads(text)
-    except json.JSONDecodeError: raise BuildError(f"Teacher 返回不是 JSON；原文已保存待人工修复：{row['source_id']}") from None
+def _candidate_from_reply(row: dict[str,Any], text: str, model: str | None, usage: Any,
+                          provenance: dict[str,Any] | None = None) -> dict[str,Any]:
+    fenced=False
+    try:
+        data=json.loads(text)
+    except json.JSONDecodeError:
+        stripped=text.strip() if isinstance(text,str) else ""
+        match=re.fullmatch(r"```json[ \t]*\r?\n([\s\S]*?)\r?\n```",stripped)
+        if match is None:
+            raise BuildError(f"Teacher 返回不是 JSON；原文已保存待人工修复：{row['source_id']}") from None
+        try: data=json.loads(match.group(1))
+        except json.JSONDecodeError: raise BuildError(f"Teacher 返回不是 JSON；原文已保存待人工修复：{row['source_id']}") from None
+        fenced=True
     if not isinstance(data,dict) or set(data)-{"messages","used_source_ids","notes"}:
         raise BuildError(f"Teacher JSON 字段无效；原文已保存：{row['source_id']}")
     messages=data.get("messages")
@@ -445,8 +487,10 @@ def _candidate_from_reply(row: dict[str,Any], text: str, model: str | None, usag
         raise BuildError(f"Teacher 来源引用缺失或越界；原文已保存：{row['source_id']}")
     count=_token_count(messages)
     if count>1024: raise BuildError(f"样本 {count} tokens 超过1024；原文已保存，需人工缩简")
-    return {"sample_id":row["sample_id"],"source_id":row["source_id"],"group_id":row["group_id"],"project_id":row.get("project_id"),"split":row["split"],"messages":messages,
-      "sources":row.get("sources",[]),"evidence_scope":"Teacher改写待工程事实审核；SOURCE_FACT/DERIVED/HYPOTHESIS/UNCONFIRMED需人工标注","teacher":{"model":model,"usage":usage},"modifications":["由原文改写为中文对话"],"review":{"status":"pending_main_review","approved_for_demo":False}}
+    candidate={"sample_id":row["sample_id"],"source_id":row["source_id"],"group_id":row["group_id"],"project_id":row.get("project_id"),"split":row["split"],"messages":messages,
+      "sources":row.get("sources",[]),"evidence_scope":"Teacher改写待工程事实审核；SOURCE_FACT/DERIVED/HYPOTHESIS/UNCONFIRMED需人工标注","teacher":{"model":model,"usage":usage},"modifications":(["移除完整外层 JSON 代码围栏"] if fenced else [])+["由原文改写为中文对话"],"review":{"status":"pending_main_review","approved_for_demo":False}}
+    if provenance is not None: candidate.update(provenance)
+    return candidate
 
 
 _TOKENIZER=None
@@ -487,16 +531,24 @@ def _append_candidate(outdir: Path, row: dict[str,Any]) -> None:
     _atomic_text(path,"".join(json.dumps(x,ensure_ascii=False)+"\n" for x in existing))
 
 
-def _teacher_prompt(row: dict[str,Any]) -> str:
+def _teacher_prompt(row: dict[str,Any], review_notes: dict[str,Any] | None = None) -> str:
+    effective_notes=_effective_review_notes(row,review_notes)
+    note_section=""
+    if effective_notes is not None and (effective_notes["common_note"] or effective_notes["topic_note"]):
+        parts=["主Agent工程校注（作为优先核对的工程审阅意见；不得替换或改写来源原文，也不得把未给出的条件写成事实）："]
+        if effective_notes["common_note"]: parts.append("公共校注："+effective_notes["common_note"])
+        if effective_notes["topic_note"]: parts.append(f"当前主题 {row.get('topic','unknown')} 校注："+effective_notes["topic_note"])
+        note_section="\n".join(parts)+"\n"
+    content_rules="每条assistant通常写80-180个中文字符，分2-3个短段，不写长清单。新增示例数值和条件必须在对应user消息里明确标为假设；不得为真实芯片补造型号参数、引脚、额定值或测试结果。首轮不要主动强推品牌型号。标称位数/速率不等于实际精度；不得保证噪声、可靠性或EMC通过。阻容值和器件作用须核实具体拓扑、负载、时序、热条件及数据手册，证据不足就说明待核实。用户后续改条件时，只调整受影响部分并保留未变约束。"
     if str(row.get("source_id","")).startswith("scenario-"):
-        style="先给判断或下一步；信息足够就直接完成；最多问2-3个关键问题；少教程少清单。用户改条件时保留未改约束。"
+        style="先给判断或下一步；信息足够就直接完成；最多问2-3个关键问题；少教程少清单。"+content_rules
         turn="要求真实的用户补充条件与assistant调整方案（4-6条消息）；不可把生成指令或未来修订预告写进训练user消息。" if "修订" in row.get("task","") else "按情境自然生成1-2轮对话。"
-        return f"{style}\n{turn}\n生成用于中文通用对话能力训练的真实对话，不加入个人隐私或机器路径。\n"+json.dumps({"scenario_id":row["source_id"],"scenario":row["scenario"],"task":row.get("task")},ensure_ascii=False)
+        return note_section+f"{style}\n{turn}\n生成用于中文通用对话能力训练的真实对话，不加入个人隐私或机器路径。\n"+json.dumps({"scenario_id":row["source_id"],"scenario":row["scenario"],"task":row.get("task")},ensure_ascii=False)
     task=row.get("task","给出方案与取舍")
     turn_rule="本条要求生成2-3轮用户修订对话（4-6条消息）：先有真实工程咨询，assistant回答；再由user补充一项条件/约束，assistant据此修订方案。修订条件应自然出现在训练user消息里，不得提到生成任务或预告后续修订。" if task=="多轮需求修订" else "按信息量生成1-2轮简洁自然对话。"
-    facts="基础技术校注（高于原论坛参考；适用时使用，不适用则不硬塞）：I2C上升时间近似tr=0.8473RpC；Rp上限由tr(max)/(0.8473C)算，Rp下限用实际器件VOL(max)/IOL约束，不能把示例线缆电容当实测值或声称固定最大线长；100kHz tr(max)=1000ns，400kHz=300ns。E12只是标称值序列，不能推出具体电阻容差；LED典型Vf不是保证范围或最大电流。稳压器只有在其额定输入、负载和热条件内才支持目标输出。不要补造具体芯片引脚/额定参数。"
-    style="中文简洁对话：先给判断或下一步；信息足够就直接给方案；只问影响方案的关键问题，最多2-3个；少讲教程，避免长清单。用户补充条件时保留未变的既有约束，只改受影响部分。"
-    return f"{style}\n{turn_rule}\n{facts}\n来源回答只是待核对参考，可能不准确，不能声称已经验证。\n"+json.dumps({"task":task,"source_id":row["source_id"],"title":row.get("title_original"),"question":row.get("question_original"),"answer_reference":row.get("answer_reference_original"),"known_references":[{"source_id":row["source_id"],"url":(row.get("sources") or [{}])[0].get("source_url"),"license":(row.get("sources") or [{}])[0].get("question_license")}]},ensure_ascii=False)
+    facts="基础技术关系（仅在相关时使用，不替代器件数据手册或测量）：I2C上升时间近似tr=0.8473RpC；Rp上限可按tr(max)/(0.8473C)估算，Rp下限受具体器件VOL(max)/IOL约束；不能把示例线缆电容写成实测值或声称固定最大线长。E12是标称值序列，不能据此推出具体容差；LED典型Vf不是保证范围或最大电流。稳压器能否满足目标输出取决于具体输入、负载和热条件。缺少条件或数据手册时不要猜参数。"
+    style="中文简洁对话：先给判断或下一步；信息足够就直接给方案；只问影响方案的关键问题，最多2-3个；少讲教程。"+content_rules
+    return note_section+f"{style}\n{turn_rule}\n{facts}\n来源回答只是待核对参考，可能不准确，不能声称已经验证。\n"+json.dumps({"task":task,"source_id":row["source_id"],"title":row.get("title_original"),"question":row.get("question_original"),"answer_reference":row.get("answer_reference_original"),"known_references":[{"source_id":row["source_id"],"url":(row.get("sources") or [{}])[0].get("source_url"),"license":(row.get("sources") or [{}])[0].get("question_license")}]},ensure_ascii=False)
 
 
 if __name__=="__main__": raise SystemExit(main())

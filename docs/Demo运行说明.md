@@ -1,77 +1,52 @@
 # Demo 运行说明
 
-所有命令从项目根目录运行。数据、模型、适配器、API 凭据和实验输出放在被 Git 忽略的 `本地资料/` 或本机模型目录；下文路径只是相对路径示例。脚本不会下载模型或安装依赖。
+所有命令从项目根目录运行。候选数据、模型、适配器、API 凭据和实验输出放在被 Git 忽略的 `本地资料/` 或本机模型目录；命令中的路径均为相对路径示例。
 
-## 当前证据与待办
+## 当前状态
 
-**SOURCE_FACT**：新版 assistant-only QLoRA 小试训使用 5 条人工审核中文样例，rank 8、seq-length 1024、seed 3407，完成 3 步；train loss 为 3.463，峰值 allocated 为 3.311 GiB。adapter 已保存，并在新进程中重载生成一条 128 token 回答；回答到达生成上限，已标记为截断。旧版另有 8 条玩具对话、10 步的链路记录。
+**SOURCE_FACT**：教师 API 已恢复。首轮中文数据已完成审校；少量原始返回有正文截断或 JSON 引号问题，分别剔除或经人工核对后离线修复，原文保持不变。早期小样例也已验证训练、保存和重载链路。
 
-**DERIVED**：这些结果只说明小样本训练、adapter 保存/重载和有限生成链路可运行，不说明回答质量、领域提升或正式训练效果。
+完整来源池仍有 92 条领域训练来源候选、20 条通用情境和 19 条验证来源候选；来源数不等于已生成的中文对话数。首轮已实际冻结 30 条中文训练对话：14 条 Stack Exchange 领域来源改写、16 条自编通用与多轮情境，其中包含技术材料说明，并非纯日常闲聊。原先约 14+20 的设想调整为 14+16 以尽快获得反馈，未补造其余 4 条；完整来源池留待后续扩充。
 
-本轮评测集已审核冻结为 dev16（12 条领域题、4 条通用题）与 final50（40 条领域题、10 条通用题），题目为自编合成诊断场景，不是官方 Benchmark。领域题包含同任务族参数变体，结果应报告为40个场景，不称为40类独立任务；评测case不关联原始来源。后续更换题目时，仍需在看模型回答前审核冻结。目前准备了 96 条领域来源候选、20 条通用情境及 20 条验证来源候选，尚未全部生成并审核为训练对话。计划训练 60 步并保存 15/30/60 步，评测结果允许下降。
+首轮数据经过主 Agent 审校和本地 Qwen tokenizer 的 assistant-only 编码检查：每条 69–378 tokens，合计 7,288 tokens，其中 assistant labels 合计 4,341 tokens；全部低于 1,024 上限，无截断。训练文件 SHA-256 为 `e6cfddb55a92342e7f48bbd18f7956a30576da77f9c8074fb94837430bbb68d3`。冻结 dev16（12 条领域、4 条通用）与 final50（40 条领域、10 条通用）保持原样；Base 在 dev16 的领域 baseline 为 47.92、通用为 76.25。题目是项目自编合成诊断场景，含同一任务族参数变体；40 个场景不等于 40 个独立任务，也不是官方 Benchmark。首轮无中文 validation 数据，训练未传 `--validation`，checkpoint 依据冻结 dev16 选择。
 
-比较本地 Base 与 FT 时，应使用同一量化基座和相同输入，关闭 thinking，采用 greedy 解码、`seq-length=4096`、`max-new-tokens=1024`。Claude Opus 5.5 参照是同一 API 服务环境中的独立 messages 请求，不接收评分要点、参考答案、旧教师回答或工具；它使用服务默认解码，因此单独标注，不声称与本地解码设置完全一致。目前接口返回限流类 HTTP 429，批量生成和完整参照运行尚未完成。
+**SOURCE_FACT**：首轮新 Base 的 60 步训练已完成，平均 train loss 2.226，峰值 allocated 3.317 GiB；step 15、30、60 与 final adapter 已保存。checkpoint 推理和评分正在进行，当前尚无微调提升结论。更多数据边界见[中文数据首轮记录](中文数据首轮记录.md)。
 
-## 数据准备和审核
+## 首轮准备与训练
 
-筛选来源、划分验证样本并生成自编通用情境。正式目标以命令明确指定：
+本轮首批实际使用 14 条领域来源改写和 16 条自编通用、多轮情境，已冻结并完成训练。领域材料由教师改写并由主 Agent 作实质工程修订，通用材料由项目自编；都不是纯教师原样答案。无需凑满来源包或用完预算。
 
-```powershell
-python scripts/build_demo_data.py prepare --domain-count 96 --validation-count 20 --general-count 20 --outdir 本地资料/Demo-V1/数据
-```
-
-主 Agent 审核候选后，才为获准的来源 ID 写生成许可。示例 ID 需替换为真实、已审核的 ID：
+后续批次仍须逐条审校，只有主 Agent 批准的对话才能进入 `approved_first_run_candidates.jsonl`。`export` 不会自动筛掉未审行；输入中只要含未批准行就会停止，因此先把通过审核的行另存为批准文件，再导出。已冻结首轮数据的入口为：
 
 ```powershell
-python scripts/build_demo_data.py approve --approval-file 本地资料/Demo-V1/数据/generation_approval.json --source-id 已审核来源ID --reviewer 主Agent
-python scripts/build_demo_data.py generate --input 本地资料/Demo-V1/数据/train_sourcepack.jsonl --approval-file 本地资料/Demo-V1/数据/generation_approval.json --outdir 本地资料/Demo-V1/数据 --limit 20 --dry-run
+python scripts/build_demo_data.py export --input 本地资料/Demo-V1/数据/approved_first_run_candidates.jsonl --output 本地资料/Demo-V1/数据/train_first_run.jsonl --approved-by main
+python scripts/demo_sft.py --train 本地资料/Demo-V1/数据/train_first_run.jsonl --output-dir 本地资料/Demo-V1/实验/formal-first-001 --seq-length 1024 --rank 8 --steps 60 --save-steps 15,30,60 --seed 3407 --dry-run
 ```
 
-`generate` 的真实请求会连接已配置的教师 API；确认许可、凭据和运行范围后，去掉 `--dry-run` 才会发出请求。生成结果仍是待审候选。逐条核对来源、事实、授权与训练消息，并将通过项标为已批准后导出；训练和验证分别导出：
+dry-run 会加载本地 tokenizer 检查数据，不加载 GPU 模型。首轮验证来源候选尚未完成中文审校，因此训练时不传 `--validation`，使用冻结 dev16 比较 Base 与各 checkpoint，并据此选择 checkpoint。不要把候选验证源写成已验证数据。本轮训练已经完成，不要重复启动。
+
+本轮正式训练参数如下。当前训练已完成，以下仅记录配置，不要再次执行：
 
 ```powershell
-python scripts/build_demo_data.py export --input 本地资料/Demo-V1/数据/train_candidates.jsonl --output 本地资料/Demo-V1/数据/train.jsonl --approved-by 主Agent
-python scripts/build_demo_data.py export --input 本地资料/Demo-V1/数据/validation_candidates.jsonl --output 本地资料/Demo-V1/数据/validation.jsonl --approved-by 主Agent
+python scripts/demo_sft.py --train 本地资料/Demo-V1/数据/train_first_run.jsonl --output-dir 本地资料/Demo-V1/实验/formal-first-001 --model-path models/Qwen3.5-4B --seq-length 1024 --rank 8 --alpha 16 --learning-rate 1e-4 --gradient-accumulation 4 --steps 60 --save-steps 15,30,60 --seed 3407
 ```
 
-导出脚本会拒绝未批准或消息格式不合格的候选。若审核后不足目标数量，应记录实际数量，不要把计划数写成已收集数。
+正式训练从新的 Base 开始，使用 60 步并保存 15、30、60 步检查点；训练已完成。Base 与 checkpoint 使用相同冻结题集和配置：关闭 thinking、greedy 解码、`seq-length=4096`、`max-new-tokens=1024`。保留截断标记；完整题集跑完后才汇总比较。结论需结合逐题评分、硬错误和通用题回归。
 
-## 训练和推理
-
-以下正式试训命令对应当前计划；只有在样本审核、切分隔离和评测冻结后执行。`--train` 与 `--validation` 必须指向审核导出的文件。
-
-```powershell
-python scripts/demo_sft.py --train 本地资料/Demo-V1/数据/train.jsonl --validation 本地资料/Demo-V1/数据/validation.jsonl --output-dir 本地资料/Demo-V1/训练/run-001 --model-path models/Qwen3.5-4B --seq-length 1024 --rank 8 --steps 60 --save-steps 15,30,60 --seed 3407
-```
-
-同一冻结题集分别运行 Base 和已保存检查点。脚本默认 `seq-length=4096`、`max-new-tokens=1024`、关闭 thinking、greedy 解码；完整题目跑完后才可用于比较，截断回答保留截断标记。
+## 推理与盲评
 
 ```powershell
 python scripts/demo_infer.py --cases 本地资料/Demo-V1/评测/dev_inputs.jsonl --output 本地资料/Demo-V1/评测/base.jsonl --model-path models/Qwen3.5-4B --seq-length 4096 --max-new-tokens 1024 --run-label Base
-python scripts/demo_infer.py --cases 本地资料/Demo-V1/评测/dev_inputs.jsonl --output 本地资料/Demo-V1/评测/ft-step-15.jsonl --model-path models/Qwen3.5-4B --adapter-path 本地资料/Demo-V1/训练/run-001/adapter-step-15 --seq-length 4096 --max-new-tokens 1024 --run-label FT --step 15
+python scripts/demo_infer.py --cases 本地资料/Demo-V1/评测/dev_inputs.jsonl --output 本地资料/Demo-V1/评测/ft-step-15.jsonl --model-path models/Qwen3.5-4B --adapter-path 本地资料/Demo-V1/实验/formal-first-001/adapter-step-15 --seq-length 4096 --max-new-tokens 1024 --run-label FT --step 15
+python scripts/demo_eval_tools.py prepare-blind --answers 本地资料/Demo-V1/评测/answers.jsonl --blind 本地资料/Demo-V1/评测/blind.jsonl --mapping 本地资料/Demo-V1/评测/private_mapping.jsonl
 ```
 
-**UNCONFIRMED**：API 参照完整运行尚未成功。先用 dry-run 检查冻结题集，不读取凭据或联网：
+Claude 参照通过当前 API 服务另发独立的 messages 请求，只接收学生材料和该请求自己的历史，不提供 teacher 答案、评分要点或工具。服务使用默认解码，与本地推理配置不同；gateway 返回的模型身份信息不是独立认证。目前完整 API 参照尚未收集。先 dry-run 检查题集：
 
 ```powershell
 python scripts/demo_api_reference.py --cases 本地资料/Demo-V1/评测/dev_inputs.jsonl --output 本地资料/Demo-V1/评测/claude-opus-5-5.jsonl --env-file .env --model-id claude-opus-5-5 --run-label claude-opus-5-5 --dry-run
 ```
 
-准备发起真实参照请求时，移除 `--dry-run`；脚本有余额保留检查、默认不重试，并在失败时保存已有检查点。API 输出不含题目中的 rubric 或参考答案，HTTP 429 后先查明原因再重试。
+确认题集与预算后，去掉 `--dry-run` 才会发起真实 API 请求；需保留返回记录并审阅完整性。多个单条完整回复不代表整套参照已完成。
 
-## 盲评、汇总和绘图
-
-将各模型回答合并为每题一行的 JSONL，至少含 `case_id`、`model`、`step`、`answer`。先生成供人工盲评的回答和私有映射；映射只留在本机：
-
-```powershell
-python scripts/demo_eval_tools.py prepare-blind --answers 本地资料/Demo-V1/评测/answers.jsonl --blind 本地资料/Demo-V1/评测/blind.jsonl --mapping 本地资料/Demo-V1/评测/private_mapping.jsonl
-```
-
-人工盲评后，将评分写为每行含 `run_id`、`case_id`、`scores`、`hard_errors` 的 JSONL，再汇总并绘图：
-
-```powershell
-python scripts/demo_eval_tools.py aggregate --cases 本地资料/Demo-V1/评测/dev_grader.jsonl --answers 本地资料/Demo-V1/评测/blind.jsonl --ratings 本地资料/Demo-V1/评测/ratings.jsonl --mapping 本地资料/Demo-V1/评测/private_mapping.jsonl --out 本地资料/Demo-V1/评测/aggregate.jsonl
-python scripts/demo_eval_tools.py plot --aggregate 本地资料/Demo-V1/评测/aggregate.jsonl --loss 本地资料/Demo-V1/评测/loss.csv --out-prefix 本地资料/Demo-V1/评测/dev_curve --note "冻结题集版本与运行配置"
-```
-
-绘图所需 `loss.csv` 有 `step,loss` 两列；训练脚本实际写出的是 `训练指标.jsonl`，需据其中的 `global_step` 与 `loss` 另行整理成 CSV。评分每个适用维度取 0–2 分。单题需达到 80 分、每维至少 1 分且没有硬错误才算通过；漏答、漏评分或题集不完整会报错，不会自动补分。图表和训练 loss 都不是能力结论；结论须结合逐题评分、硬错误和通用题回归。所有题目、输出和评分仍需主 Agent 审阅。
+人工盲评后再运行 `demo_eval_tools.py aggregate` 与 `plot` 汇总。评分、图表和训练 loss 都不能单独证明能力提升；主 Agent 审阅完整结果后再更新结论。

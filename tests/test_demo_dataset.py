@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sys
 import tempfile
 import unittest
+from types import ModuleType, SimpleNamespace
+from unittest.mock import patch
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "build_demo_data.py"
@@ -77,6 +80,88 @@ class DemoSourceTests(unittest.TestCase):
         self.assertEqual(row["wallet_usd"],9.9)
         for private in ("secret-key","https://private.example","prompt text"):
             self.assertNotIn(private,text)
+
+
+class CandidateParsingTests(unittest.TestCase):
+    def setUp(self):
+        self.row={"sample_id":"demo-train-se-question-1","source_id":"se-question-1","group_id":"se-group-1","split":"train","task":"给出方案与取舍","sources":[]}
+        self.payload={"messages":[{"role":"user","content":"如何选择？"},{"role":"assistant","content":"先确认具体条件，再核对器件资料。"}],"used_source_ids":["se-question-1"]}
+
+    def test_complete_json_fence_is_accepted_and_recorded(self):
+        text="```json\n"+json.dumps(self.payload,ensure_ascii=False)+"\n```"
+        with patch.object(demo,"_token_count",return_value=32):
+            candidate=demo._candidate_from_reply(self.row,text,"teacher",{"output_tokens":12})
+        self.assertEqual(candidate["messages"],self.payload["messages"])
+        self.assertIn("移除完整外层 JSON 代码围栏",candidate["modifications"])
+        self.assertFalse(candidate["review"]["approved_for_demo"])
+
+    def test_json_fence_surrounded_by_prose_is_rejected(self):
+        text="结果如下：\n```json\n"+json.dumps(self.payload,ensure_ascii=False)+"\n```"
+        with self.assertRaisesRegex(demo.BuildError,"不是 JSON"):
+            demo._candidate_from_reply(self.row,text,"teacher",{})
+
+    def test_unknown_dangerous_field_remains_rejected(self):
+        payload={**self.payload,"debug":"hidden chain of thought"}
+        with self.assertRaisesRegex(demo.BuildError,"字段无效"):
+            demo._candidate_from_reply(self.row,json.dumps(payload,ensure_ascii=False),"teacher",{})
+
+
+class ReviewNoteTests(unittest.TestCase):
+    def setUp(self):
+        self.row={"sample_id":"demo-train-se-question-1","source_id":"se-question-1","group_id":"se-group-1","split":"train","topic":"i2c","task":"给出方案与取舍","title_original":"I2C pull-up","question_original":"How to select?","answer_reference_original":"Use constraints.","sources":[]}
+        self.notes={"topic_notes":{"i2c":"I2C_TOPIC_RULE","adc":"OTHER_TOPIC_RULE"},"common_note":"COMMON_RULE","sources":[{"title":"review metadata","url":"https://private.example/source"}]}
+
+    def test_prompt_only_includes_current_topic_and_common_note(self):
+        prompt=demo._teacher_prompt(self.row,self.notes)
+        self.assertIn("COMMON_RULE",prompt)
+        self.assertIn("I2C_TOPIC_RULE",prompt)
+        self.assertNotIn("OTHER_TOPIC_RULE",prompt)
+        self.assertNotIn("https://private.example/source",prompt)
+
+    def test_note_hash_and_fingerprint_change_without_hashing_api_key(self):
+        config=SimpleNamespace(provider="test",base_url="https://api.example/v1",model_id="model",openai_api="responses",api_key="secret-one")
+        first_hash=demo._review_note_hash(self.row,self.notes)
+        changed={**self.notes,"topic_notes":{"i2c":"CHANGED_RULE","adc":"OTHER_TOPIC_RULE"}}
+        second_hash=demo._review_note_hash(self.row,changed)
+        self.assertNotEqual(first_hash,second_hash)
+        self.assertNotEqual(demo._config_fingerprint(config,first_hash),demo._config_fingerprint(config,second_hash))
+        same_hash_config=SimpleNamespace(**{**vars(config),"api_key":"secret-two"})
+        self.assertEqual(demo._config_fingerprint(config,first_hash),demo._config_fingerprint(same_hash_config,first_hash))
+
+    def test_resume_reuses_legacy_raw_without_calling_teacher(self):
+        class FakeTeacherError(Exception):
+            pass
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp)
+            input_path=root/"input.jsonl"
+            approval_path=root/"approval.json"
+            outdir=root/"out"
+            outdir.mkdir()
+            input_path.write_text(json.dumps(self.row,ensure_ascii=False)+"\n",encoding="utf-8")
+            approval_path.write_text(json.dumps({"reviewer":"main","status":"approved_for_teacher_generation","source_ids":[self.row["source_id"]]}),encoding="utf-8")
+            balance=10.0
+            (outdir/".teacher_budget.json").write_text(json.dumps({"starting_balance":balance,"cap_usd":10.0,"reserve_usd":2.0}),encoding="utf-8")
+            raw_text=json.dumps({"messages":[{"role":"user","content":"How?"},{"role":"assistant","content":"Check the conditions first."}],"used_source_ids":[self.row["source_id"]]},ensure_ascii=False)
+            config=SimpleNamespace(provider="test",base_url="https://api.example/v1",model_id="model",openai_api="responses",api_key="unused",max_retries=3,max_output_tokens=1024)
+            prompt_hash=demo._sha(demo.SYSTEM_PROMPT+"\0"+demo._teacher_prompt(self.row))
+            raw={"status":"success","source_id":self.row["source_id"],"row_sha256":demo._sha(demo._canonical(self.row)),"prompt_sha256":prompt_hash,"config_fingerprint":demo._config_fingerprint(config),"raw_text":raw_text,"model":"test","usage":{"output_tokens":8}}
+            raw_path=outdir/"teacher_raw"/(self.row["source_id"]+".json")
+            raw_path.parent.mkdir()
+            raw_path.write_text(json.dumps(raw,ensure_ascii=False),encoding="utf-8")
+            before=raw_path.read_bytes()
+            api=ModuleType("teacher_api")
+            api.TeacherError=FakeTeacherError
+            api.call_teacher=lambda *args: self.fail("resume must not call Teacher")
+            api.load_config=lambda path: config
+            args=SimpleNamespace(input=input_path,approval_file=approval_path,env_file=root/".env",outdir=outdir,limit=1,dry_run=False,resume=True)
+            with patch.dict(sys.modules,{"teacher_api":api}),patch.object(demo,"_wallet",return_value=balance),patch.object(demo,"_ensure_tokenizer"),patch.object(demo,"_token_count",return_value=20):
+                self.assertEqual(demo.generate(args),0)
+            self.assertEqual(raw_path.read_bytes(),before)
+            candidate=json.loads((outdir/"train_candidates.jsonl").read_text(encoding="utf-8"))
+            self.assertEqual(candidate["review_note_hash"],None)
+            self.assertEqual(candidate["row_hash"],raw["row_sha256"])
+            self.assertEqual(candidate["prompt_hash"],prompt_hash)
+            self.assertEqual(candidate["config_fingerprint"],raw["config_fingerprint"])
 
 
 if __name__ == "__main__":
