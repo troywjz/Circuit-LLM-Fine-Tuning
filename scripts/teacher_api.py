@@ -19,11 +19,13 @@ class TeacherError(Exception):
     """对外安全的教师接口错误，不包含凭据或响应正文。"""
 
     def __init__(self, message: str, *, http_status: int | None = None,
-                 category: str | None = None, retry_after_seconds: float | None = None):
+                 category: str | None = None, retry_after_seconds: float | None = None,
+                 reason: str | None = None):
         super().__init__(message)
         self.http_status = http_status
         self.category = category
         self.retry_after_seconds = retry_after_seconds
+        self.reason = reason
 
 
 @dataclass
@@ -57,6 +59,7 @@ def _classify_http_error(exc: urllib.error.HTTPError) -> TeacherError:
     except Exception:
         raw = b""
     category = "unknown"
+    reason = None
     try:
         parsed = json.loads(raw.decode("utf-8", errors="replace")) if raw else None
         item = parsed.get("error", parsed) if isinstance(parsed, dict) else None
@@ -67,7 +70,11 @@ def _classify_http_error(exc: urllib.error.HTTPError) -> TeacherError:
                 if isinstance(value, str):
                     fragments.append(value.lower())
         detail = " ".join(fragments)
-        if any(word in detail for word in ("insufficient_quota", "quota", "billing", "credit balance", "payment required", "hard limit")):
+        # 只有服务明确说余额不足，才能把它作为后续充值通知的依据。
+        if any(word in detail for word in ("insufficient_balance", "insufficient balance", "insufficient funds", "余额不足")):
+            category = "quota_billing"
+            reason = "insufficient_balance"
+        elif any(word in detail for word in ("insufficient_quota", "quota", "billing", "credit balance", "payment required", "hard limit")):
             category = "quota_billing"
         elif any(word in detail for word in ("invalid_api_key", "authentication", "unauthorized", "invalid x-api-key", "permission denied")):
             category = "auth"
@@ -77,6 +84,8 @@ def _classify_http_error(exc: urllib.error.HTTPError) -> TeacherError:
         pass
     if category == "unknown" and exc.code in {401, 403}:
         category = "auth"
+    if category == "unknown" and exc.code == 402:
+        category = "quota_billing"
     retry_after = None
     if exc.code == 429 and exc.headers is not None:
         try:
@@ -94,7 +103,7 @@ def _classify_http_error(exc: urllib.error.HTTPError) -> TeacherError:
     }
     return TeacherError(f"{labels[category]}（HTTP {exc.code}）。",
                         http_status=exc.code, category=category,
-                        retry_after_seconds=retry_after)
+                        retry_after_seconds=retry_after, reason=reason)
 
 
 def _safe_url(value: str, name: str, *, allow_empty: bool = False) -> str:
