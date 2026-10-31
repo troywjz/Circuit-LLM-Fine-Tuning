@@ -95,6 +95,14 @@ def _classify_http_error(exc: urllib.error.HTTPError) -> TeacherError:
             "connection refused", "connect failed", "econnrefused",
             "no route to host", "无法连接", "积极拒绝")):
         reason = "upstream_unreachable"
+    # Cloudflare 边缘错误页说明请求在边缘就被挡下，从未进入上游模型。
+    # 两种形态都要认：纯文本 "error code: 502"，以及 JSON 形式的 cloudflare-5xx-errors 说明页。
+    # 这与网关作为正常 API 错误回传的 5xx 不同，后者不能重发；前者可以安全切换下一顺位。
+    edge_blocked = (re.search(rb"error\s+code:\s*5\d\d", raw, re.IGNORECASE) is not None
+                    or b"cloudflare-5xx-errors" in raw.lower()
+                    or b"error 502: bad gateway" in raw.lower())
+    if reason is None and edge_blocked:
+        reason = "upstream_unreachable"
     if category == "unknown" and exc.code in {401, 403}:
         category = "auth"
     if category == "unknown" and exc.code == 402:
@@ -453,7 +461,10 @@ def _call_teacher_body(config: TeacherConfig, body: dict[str, Any]) -> dict[str,
                     time.sleep(min(2 ** attempt, 10))
                     continue
             if 300 <= code < 400:
-                raise TeacherError("教师接口重定向已拒绝。") from None
+                # 仍然不跟随重定向（防止认证头被转发到其他位置），但保留状态码，
+                # 上层据此判断能否安全切换到下一个顺位。
+                raise TeacherError("教师接口重定向已拒绝。", http_status=code,
+                                   category="redirect") from None
             raise classified from None
         except (TimeoutError, urllib.error.URLError) as exc:
             transient = not isinstance(exc, urllib.error.URLError) or isinstance(exc.reason, TimeoutError)

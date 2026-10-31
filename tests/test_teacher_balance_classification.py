@@ -38,5 +38,32 @@ class TeacherBalanceClassificationTests(unittest.TestCase):
         self.assertIsNone(error.reason)
 
 
+def raw_classify(status: int, body: bytes):
+    error = HTTPError("https://placeholder.invalid/v1", status, "private reason", {},
+                      io.BytesIO(body))
+    return _classify_http_error(error)
+
+
+class EdgeGatewayErrorTests(unittest.TestCase):
+    """Cloudflare 边缘错误页代表请求没进入模型，与网关回传的 5xx 必须分开。"""
+
+    def test_cloudflare_json_error_page_is_treated_as_unreachable(self):
+        # 中转站源站不可达时，Cloudflare 会回这样一页 JSON 说明，正文里没有模型错误信息。
+        body = (b'{"type":"https://developers.cloudflare.com/support/troubleshooting/'
+                b'http-status-codes/cloudflare-5xx-errors/error-502/","title":'
+                b'"Error 502: Bad gateway","status":502}')
+        error = raw_classify(502, body)
+        self.assertEqual(error.reason, "upstream_unreachable")
+
+    def test_cloudflare_plain_text_error_page_is_treated_as_unreachable(self):
+        error = raw_classify(502, b"error code: 502\n")
+        self.assertEqual(error.reason, "upstream_unreachable")
+
+    def test_gateway_json_502_stays_unclassified(self):
+        # 网关自己回传的 JSON 502 可能已在上游处理过，不能标成"没送达"而重发。
+        error = classify(502, "server_error")
+        self.assertIsNone(error.reason)
+
+
 if __name__ == "__main__":
     unittest.main()
