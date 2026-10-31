@@ -639,6 +639,30 @@ def _generate_account(args: argparse.Namespace) -> int:
         state.update(extra)
         _atomic_json(ledger,state)
 
+    # 兼容此前把 HTTP 429 记为 unknown 的账本：429 是明确拒绝，按 DATA 顺序转到下一个 profile，
+    # 不再向已限流的 profile 重发。若服务正文已明确表示额度/账单受限，则不做线路回退。
+    if (state.get("status")=="request_failed" and state.get("last_http_status")==429
+            and state.get("last_error_category") in {"unknown","rate_limit"}):
+        failed_profile=state.get("active_profile",profile)
+        next_profile=next((name for name in order[order.index(failed_profile)+1:]
+                           if name in configs),None) if failed_profile in order else None
+        failure_path=outdir/"调用失败.json"
+        try: failure=json.loads(failure_path.read_text(encoding="utf-8"))
+        except (OSError,UnicodeError,json.JSONDecodeError): failure={}
+        failed_source=(failure.get("source_id") if isinstance(failure,dict)
+                       and failure.get("http_status")==429 else None)
+        failed_row=next((row for row in rows if row.get("source_id")==failed_source),None)
+        if next_profile is None or failed_row is None:
+            raise BuildError("已记录HTTP 429，但无法安全定位失败样本或没有备用profile；未重发")
+        state.setdefault("profile_attempts",[]).append({"sample_id":failed_row["sample_id"],
+            "failed_profile":failed_profile,"next_profile":next_profile,
+            "http_status":429,"category":"rate_limit"})
+        save_state("profile_fallback_pending",running_sample_id=None,active_profile=next_profile,
+                   last_failed_sample_id=failed_row["sample_id"],last_error_category="rate_limit",
+                   last_http_status=429,last_error_reason=None,retry_after_seconds=None)
+        profile=next_profile
+        config=configs[profile]
+
     # 中断时先找已完整保存的回复；找不到就保留未知状态，避免重复付费请求。
     if state.get("status") in {"request_unknown","response_saved","candidate_pending_review"}:
         sid=state.get("running_sample_id")
@@ -727,7 +751,7 @@ def _generate_account(args: argparse.Namespace) -> int:
                 balance=balance_or_stop(config)
                 save_state("request_unknown",running_sample_id=sid,active_profile=profile,
                            last_balance=balance,last_error_category=None,last_http_status=None,
-                           last_error_reason=None,retry_after_seconds=None)
+                           last_error_reason=None,retry_after_seconds=None,last_failed_sample_id=None)
                 try:
                     response=call_teacher(config,system_prompt,user_prompt)
                     break
@@ -764,7 +788,8 @@ def _generate_account(args: argparse.Namespace) -> int:
                         save_state("profile_fallback_pending",running_sample_id=None,
                                    active_profile=next_profile,last_balance=post_balance,
                                    last_error_category=category,last_http_status=status,
-                                   last_error_reason=reason,retry_after_seconds=retry)
+                                   last_error_reason=reason,retry_after_seconds=retry,
+                                   last_failed_sample_id=sid)
                         continue
                     outcome="request_failed" if definite else "request_unknown"
                     if definite and category=="quota_billing": outcome="balance_insufficient"
@@ -772,7 +797,7 @@ def _generate_account(args: argparse.Namespace) -> int:
                                last_balance=post_balance,last_error_category=category,
                                last_http_status=status if isinstance(status,int) else None,
                                last_error_reason=reason,retry_after_seconds=retry,
-                               failed_profile_attempts=attempted_profiles)
+                               failed_profile_attempts=attempted_profiles,last_failed_sample_id=sid)
                     raise BuildError(f"教师请求停止：{category}；已保存处理进度") from None
             if response is None:
                 raise BuildError("数据准备路由没有可用 profile；停止请求")
