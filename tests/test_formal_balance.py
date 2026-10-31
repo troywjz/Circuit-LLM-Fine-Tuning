@@ -32,10 +32,12 @@ def _inputs(root: Path):
         openai_api="responses", api_key="unused", max_retries=3, max_output_tokens=128)
     api = ModuleType("teacher_api")
     api.TeacherError = type("TeacherError", (Exception,), {})
-    api.load_config = lambda path: config
+    api.load_config = lambda path, **kwargs: config
+    api.load_profile_order = lambda path, case: ("backup", "primary") if case == "data" else ("primary",)
     args = SimpleNamespace(input=input_path, approval_file=approval_path, env_file=root / ".env",
         outdir=root / "本地资料" / "out", limit=1, dry_run=False, resume=False, use_account_balance=True,
         review_notes=None)
+    _write_eval_lists(root)
     return args, config, api
 
 
@@ -53,7 +55,128 @@ def _reply(source_id):
     return {"text":json.dumps({"messages":[{"role":"user","content":"如何选择？"},{"role":"assistant","content":"先核对具体条件与资料。"}],"used_source_ids":[source_id]},ensure_ascii=False),"model":"offline","usage":{"output_tokens":8}}
 
 
+def _write_eval_lists(root: Path, dev_rows=None, final_rows=None):
+    eval_dir = root / "本地资料" / "正式实验" / "评测"
+    eval_dir.mkdir(parents=True, exist_ok=True)
+    for name, rows in (("开发集-冻结-v1.jsonl", dev_rows or []), ("终测集-冻结-v1.jsonl", final_rows or [])):
+        (eval_dir / name).write_text("".join(json.dumps(row, ensure_ascii=False)+"\n" for row in rows), encoding="utf-8")
+
+
 class AccountBalanceSafetyTests(unittest.TestCase):
+    def test_same_batch_duplicate_source_or_group_rejected_before_request(self):
+        for key in ("source_id", "group_id"):
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as temp:
+                args, _, _ = _inputs(Path(temp))
+                _add_second_source(args)
+                rows = [json.loads(line) for line in args.input.read_text(encoding="utf-8").splitlines()]
+                rows[1][key] = rows[0][key]
+                args.input.write_text("".join(json.dumps(row, ensure_ascii=False)+"\n" for row in rows), encoding="utf-8")
+                with self.assertRaisesRegex(demo.BuildError, "重复.*未发送 API 请求"):
+                    demo._account_targets(args)
+
+    def test_historical_train_reviewed_sourcepack_and_candidate_duplicates_rejected(self):
+        for location, duplicate_key in (("training", "sample_id"), ("approved", "source_id"),
+                                        ("sourcepack", "group_id"), ("candidate", "group_id")):
+            with self.subTest(location=location), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                args, _, _ = _inputs(root)
+                _write_eval_lists(root)
+                history = {"sample_id":"old-sample","source_id":"old-source","group_id":"old-group",
+                           "split":"train", "sources":[]}
+                if location == "training":
+                    path = root/"本地资料"/"正式实验"/"训练"/"训练集候选-部分-v1.jsonl"
+                elif location == "approved":
+                    path = root/"本地资料"/"正式实验"/"训练"/"批次已审-v1.jsonl"
+                elif location == "sourcepack":
+                    path = root/"本地资料"/"正式实验"/"批次"/"old"/"来源包.jsonl"
+                else:
+                    path = root/"本地资料"/"正式实验"/"批次"/"old"/"生成结果"/"train_candidates.jsonl"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                current = json.loads(args.input.read_text(encoding="utf-8"))
+                history[duplicate_key] = current[duplicate_key]
+                path.write_text(json.dumps(history, ensure_ascii=False)+"\n", encoding="utf-8")
+                args.dry_run = True
+                with patch.object(demo,"ROOT",root):
+                    with self.assertRaisesRegex(demo.BuildError,"重复"):
+                        demo.generate(args)
+
+    def test_allow_source_reuse_skips_training_history_only(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp); args,_,_=_inputs(root); _write_eval_lists(root)
+            row=json.loads(args.input.read_text(encoding="utf-8"))
+            row["sample_id"]="old-sample"
+            history=root/"本地资料"/"正式实验"/"训练"/"训练集候选-部分-v1.jsonl"
+            history.parent.mkdir(parents=True)
+            history.write_text(json.dumps(row,ensure_ascii=False)+"\n",encoding="utf-8")
+            args.dry_run=True; args.allow_source_reuse=True
+            with patch.object(demo,"ROOT",root):
+                self.assertEqual(demo.generate(args),0)
+
+    def test_allow_source_reuse_never_allows_sample_id_collision(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp); args,_,_=_inputs(root); _write_eval_lists(root)
+            current=json.loads(args.input.read_text(encoding="utf-8"))
+            history={**current,"source_id":"older-source","group_id":"older-group"}
+            path=root/"本地资料"/"正式实验"/"训练"/"训练集候选-部分-v1.jsonl"
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps(history,ensure_ascii=False)+"\n",encoding="utf-8")
+            args.dry_run=True; args.allow_source_reuse=True
+            with patch.object(demo,"ROOT",root):
+                with self.assertRaisesRegex(demo.BuildError,"sample_id.*重复"):
+                    demo.generate(args)
+
+    def test_live_account_reuse_rejected_before_wallet_post_and_releases_lock(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp); args,_,api=_inputs(root); _write_eval_lists(root)
+            row=json.loads(args.input.read_text(encoding="utf-8"))
+            history=root/"本地资料"/"正式实验"/"训练"/"训练集候选-部分-v1.jsonl"
+            history.parent.mkdir(parents=True,exist_ok=True)
+            history.write_text(json.dumps(row,ensure_ascii=False)+"\n",encoding="utf-8")
+            args.dry_run=False
+            api.call_teacher=lambda *a: self.fail("重复来源不得 POST")
+            private=root/"本地资料"
+            with patch.object(demo,"ROOT",root),patch.dict(sys.modules,{"teacher_api":api}), \
+                    patch.object(demo,"_wallet",side_effect=AssertionError("重复来源不得查询余额")):
+                with self.assertRaisesRegex(demo.BuildError,"重复"):
+                    demo.generate(args)
+            self.assertFalse((private/".formal_teacher_api.lock").exists())
+
+    def test_frozen_eval_id_and_dataset_row_match_always_rejected_without_text_leak(self):
+        for mode in ("source_id", "dataset_row"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp:
+                root=Path(temp); args,_,_=_inputs(root)
+                row=json.loads(args.input.read_text(encoding="utf-8"))
+                eval_row={"source_id":"frozen-other","group_id":"frozen-group","project_id":"frozen-project",
+                          "input_messages":[{"role":"user","content":"SECRET_QUESTION_SENTINEL"}],
+                          "scoring":{"SECRET_SCORING_SENTINEL":1}}
+                if mode=="source_id":
+                    eval_row["source_id"]=row["source_id"]
+                else:
+                    row["sources"]=[{"dataset":"dataset-X","revision":"rev-X","row_index":17}]
+                    args.input.write_text(json.dumps(row,ensure_ascii=False)+"\n",encoding="utf-8")
+                    eval_row["sources"]=[{"dataset":"dataset-X","revision":"rev-X","row_index":17}]
+                _write_eval_lists(root,dev_rows=[eval_row])
+                args.dry_run=True; args.allow_source_reuse=True
+                with patch.object(demo,"ROOT",root):
+                    with self.assertRaises(demo.BuildError) as caught:
+                        demo.generate(args)
+                self.assertNotIn("SECRET_QUESTION_SENTINEL",str(caught.exception))
+                self.assertNotIn("SECRET_SCORING_SENTINEL",str(caught.exception))
+
+    def test_missing_frozen_lists_fail_closed_and_dry_run_never_checks_wallet_or_posts(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp); args,_,api=_inputs(root); args.dry_run=True
+            eval_dir=root/"本地资料"/"正式实验"/"评测"
+            for path in eval_dir.glob("*.jsonl"):
+                path.unlink()
+            api.call_teacher=lambda *a: self.fail("dry-run must not POST")
+            with patch.object(demo,"ROOT",root),patch.object(demo,"_wallet",side_effect=AssertionError("dry-run must not query wallet")):
+                with self.assertRaisesRegex(demo.BuildError,"清单缺失"):
+                    demo.generate(args)
+            _write_eval_lists(root)
+            with patch.object(demo,"ROOT",root),patch.object(demo,"_wallet",side_effect=AssertionError("dry-run must not query wallet")):
+                self.assertEqual(demo.generate(args),0)
+
     def test_zero_balance_never_calls_teacher(self):
         with tempfile.TemporaryDirectory() as temp:
             args, config, api = _inputs(Path(temp))
@@ -221,7 +344,7 @@ class AccountBalanceSafetyTests(unittest.TestCase):
 
     def test_existing_lock_prevents_concurrent_request(self):
         with tempfile.TemporaryDirectory() as temp:
-            root=Path(temp);args,_,api=_inputs(root);private=root/'本地资料';private.mkdir()
+            root=Path(temp);args,_,api=_inputs(root);private=root/'本地资料';private.mkdir(exist_ok=True)
             lock=private/'.formal_teacher_api.lock';lock.write_text('{"pid":1,"lock_id":"other"}',encoding='utf-8')
             api.call_teacher=lambda *a: self.fail('已有锁时不应发请求')
             with patch.object(demo,'ROOT',root),patch.dict(sys.modules,{'teacher_api':api}):
