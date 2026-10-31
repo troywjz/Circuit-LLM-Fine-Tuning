@@ -143,6 +143,7 @@ def _fingerprint(config, args, cases_hash: str) -> str:
              "timeout_seconds": config.timeout_seconds, "max_retries": config.max_retries,
              "openai_max_tokens_field": config.openai_max_tokens_field,
              "extra_body": config.extra_body,
+             "teacher_profile": getattr(args, "effective_teacher_profile", getattr(args, "teacher_profile", "primary")),
              "cases_sha256": cases_hash}
     return _sha(json.dumps(value, sort_keys=True, ensure_ascii=False).encode())
 
@@ -162,7 +163,7 @@ def _validate_reference_config(config) -> None:
 def _run_account(args, cases: list[dict], cases_hash: str) -> int:
     """按账户实际余额运行独立参考；未决请求不会在续跑时自动重发。"""
     from build_demo_data import ROOT, BuildError, _account_generation_lock
-    from teacher_api import TeacherError, call_teacher_messages, load_config
+    from teacher_api import TeacherError, call_teacher_messages, load_config, load_profile_order
 
     private_root = (ROOT / "本地资料").resolve()
     output, state_path = args.output.resolve(), args.budget_state.resolve()
@@ -174,11 +175,23 @@ def _run_account(args, cases: list[dict], cases_hash: str) -> int:
     cases_path = args.cases.resolve()
     if len({output, state_path, cases_path}) != 3:
         raise DemoDataError("参考输出、账户账本和题目文件必须是不同文件")
+    profile = getattr(args, "teacher_profile", "primary")
+    if profile != "primary":
+        raise DemoDataError("强参考账户模式只允许 primary profile；未发送参考请求")
+    try:
+        if load_profile_order(args.env_file, "reference") != ("primary",):
+            raise DemoDataError("TEACHER_PROFILE_ORDER_REFERENCE 必须为 primary；未发送参考请求")
+    except TeacherError as exc:
+        raise DemoDataError(f"参考 profile 顺序无效；未发送参考请求：{exc}") from None
+    args.effective_teacher_profile = profile
     for case in cases:
         roles = [m["role"] for m in case["input_messages"]]
         if roles not in (["user"], ["system", "user"]):
             raise DemoDataError("强参考的初始消息只能包含学生材料；后续回答使用本模型自己的历史")
-    config = load_config(args.env_file)
+    try:
+        config = load_config(args.env_file) if profile == "primary" else load_config(args.env_file, profile=profile)
+    except TeacherError as exc:
+        raise DemoDataError(f"{profile} API 配置无效；未发送参考请求：{exc}") from None
     config.model_id = args.model_id or config.model_id
     config.max_output_tokens = args.max_output_tokens
     config.max_retries = 0
@@ -235,12 +248,14 @@ def _run_account(args, cases: list[dict], cases_hash: str) -> int:
                 except (OSError, UnicodeError, json.JSONDecodeError):
                     raise DemoDataError("参考账户账本无法读取") from None
                 if (not isinstance(state, dict) or state.get("mode") != "account_balance_reference"
+                        or state.get("teacher_profile", "primary") != profile
                         or state.get("run_fingerprint") != fingerprint or state.get("cases_sha256") != cases_hash):
                     raise DemoDataError("参考账户账本与当前题目或配置不一致")
             else:
                 if rows:
                     raise DemoDataError("已有参考输出但缺少账户账本")
                 state = {"mode": "account_balance_reference", "run_fingerprint": fingerprint,
+                         "teacher_profile": profile,
                          "cases_sha256": cases_hash, "starting_balance": None, "last_balance": None}
 
             def save(status: str, **extra) -> None:
@@ -371,6 +386,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     parser.add_argument("--model-id", help="强参考模型 ID；账户余额模式默认使用环境配置")
+    parser.add_argument("--teacher-profile", choices=("primary", "backup"), default="primary",
+                        help="强参考账户模式仅允许 primary profile")
     parser.add_argument("--run-label", default="claude-opus-5-5")
     parser.add_argument("--step0", type=int, default=0)
     parser.add_argument("--limit", type=int)
@@ -390,6 +407,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.use_account_balance:
             return _run_account(args, cases, cases_hash)
+        # 旧预算模式始终使用现有主配置，CLI 的账户模式profile不影响它。
+        args.effective_teacher_profile = "primary"
         from teacher_api import TeacherError, call_teacher_messages, load_config
         config = load_config(args.env_file)
         config.model_id = args.model_id or "claude-opus-5-5"

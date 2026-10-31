@@ -148,8 +148,36 @@ def _parse_env_file(path: Path) -> dict[str, str]:
     return result
 
 
-def load_config(env_file: Path, *, require_credentials: bool = True) -> TeacherConfig:
-    """读取指定 .env，TEACHER_ 环境变量优先；不探测其他凭据文件。"""
+def load_profile_order(env_file: Path, case: str) -> tuple[str, ...]:
+    """读取并校验连接测试、数据整理或参考评测所用的 API profile 顺序。"""
+    keys = {"connectivity": "TEACHER_PROFILE_ORDER_CONNECTIVITY",
+            "data": "TEACHER_PROFILE_ORDER_DATA",
+            "reference": "TEACHER_PROFILE_ORDER_REFERENCE"}
+    defaults = {"connectivity": ("backup", "primary"),
+                "data": ("backup", "primary"),
+                "reference": ("primary",)}
+    if case not in keys:
+        raise TeacherError("Profile 场景必须是 connectivity、data 或 reference。")
+    values = _parse_env_file(Path(env_file))
+    key = keys[case]
+    if key in os.environ:
+        raw = os.environ[key]
+    else:
+        raw = values.get(key, ",".join(defaults[case]))
+    order = tuple(item.strip().lower() for item in raw.split(","))
+    if (not order or any(item not in {"primary", "backup"} for item in order)
+            or len(set(order)) != len(order)):
+        raise TeacherError(f"{key} 只能是逗号分隔且不重复的 primary/backup。")
+    return order
+
+
+def load_config(env_file: Path, *, require_credentials: bool = True,
+                profile: str = "primary") -> TeacherConfig:
+    """读取明确选择的API配置；主配置和备用配置互不混用。"""
+    prefixes = {"primary": "TEACHER_", "backup": "TEACHER_BACKUP_"}
+    if profile not in prefixes:
+        raise TeacherError("Teacher profile 只能是 primary 或 backup。")
+    prefix = prefixes[profile]
     values = _parse_env_file(Path(env_file))
     names = (
         "PROVIDER", "OPENAI_API", "BASE_URL", "API_KEY", "MODEL_ID",
@@ -157,22 +185,22 @@ def load_config(env_file: Path, *, require_credentials: bool = True) -> TeacherC
         "OPENAI_MAX_TOKENS_FIELD", "EXTRA_BODY_JSON",
     )
     for name in names:
-        env_name = "TEACHER_" + name
+        env_name = prefix + name
         if env_name in os.environ:
             values[env_name] = os.environ[env_name]
 
     def get(name: str, default: str = "") -> str:
-        return values.get("TEACHER_" + name, default).strip()
+        return values.get(prefix + name, default).strip()
 
     provider = get("PROVIDER", "openai").lower()
     api = get("OPENAI_API", "responses").lower()
     token_field = get("OPENAI_MAX_TOKENS_FIELD", "max_completion_tokens")
     if provider not in {"openai", "anthropic"}:
-        raise TeacherError("TEACHER_PROVIDER 仅支持 openai 或 anthropic。")
+        raise TeacherError(f"{prefix}PROVIDER 仅支持 openai 或 anthropic。")
     if api not in {"responses", "chat_completions"}:
-        raise TeacherError("TEACHER_OPENAI_API 仅支持 responses 或 chat_completions。")
+        raise TeacherError(f"{prefix}OPENAI_API 仅支持 responses 或 chat_completions。")
     if token_field not in {"max_completion_tokens", "max_tokens"}:
-        raise TeacherError("TEACHER_OPENAI_MAX_TOKENS_FIELD 配置无效。")
+        raise TeacherError(f"{prefix}OPENAI_MAX_TOKENS_FIELD 配置无效。")
     try:
         max_tokens = int(get("MAX_OUTPUT_TOKENS", "8192"))
         timeout = float(get("TIMEOUT_SECONDS", "120"))
@@ -181,27 +209,27 @@ def load_config(env_file: Path, *, require_credentials: bool = True) -> TeacherC
         raise TeacherError("token、timeout 或 retry 数值配置无效。") from None
     if (max_tokens < 1 or max_tokens > 1_000_000 or not math.isfinite(timeout)
             or timeout <= 0 or timeout > 3600 or retries < 0 or retries > 2):
-        raise TeacherError("token、timeout 或 retry 数值超出允许范围。")
-    base = _safe_url(get("BASE_URL"), "TEACHER_BASE_URL", allow_empty=not require_credentials)
-    proxy = _safe_url(get("PROXY_URL"), "TEACHER_PROXY_URL", allow_empty=True)
+        raise TeacherError(f"{prefix}token、timeout 或 retry 数值配置无效或超出范围。")
+    base = _safe_url(get("BASE_URL"), prefix + "BASE_URL", allow_empty=not require_credentials)
+    proxy = _safe_url(get("PROXY_URL"), prefix + "PROXY_URL", allow_empty=True)
     key, model = get("API_KEY"), get("MODEL_ID")
     if require_credentials:
         if not base or base == "http://placeholder" or base == "https://example.com":
-            raise TeacherError("live 调用需要有效的 TEACHER_BASE_URL。")
+            raise TeacherError(f"live 调用需要有效的 {prefix}BASE_URL。")
         if key.lower() in _PLACEHOLDERS:
-            raise TeacherError("live 调用需要有效的 TEACHER_API_KEY。")
+            raise TeacherError(f"live 调用需要有效的 {prefix}API_KEY。")
         if model.lower() in _PLACEHOLDERS:
-            raise TeacherError("live 调用需要有效的 TEACHER_MODEL_ID。")
+            raise TeacherError(f"live 调用需要有效的 {prefix}MODEL_ID。")
     raw_extra = get("EXTRA_BODY_JSON", "{}") or "{}"
     try:
         extra = json.loads(raw_extra)
     except json.JSONDecodeError:
-        raise TeacherError("TEACHER_EXTRA_BODY_JSON 必须是合法 JSON object。") from None
+        raise TeacherError(f"{prefix}EXTRA_BODY_JSON 必须是合法 JSON object。") from None
     if not isinstance(extra, dict):
-        raise TeacherError("TEACHER_EXTRA_BODY_JSON 必须是 JSON object。")
+        raise TeacherError(f"{prefix}EXTRA_BODY_JSON 必须是 JSON object。")
     forbidden = _PROTECTED_EXTRA.intersection(extra)
     if forbidden:
-        raise TeacherError("TEACHER_EXTRA_BODY_JSON 包含受保护的请求字段。")
+        raise TeacherError(f"{prefix}EXTRA_BODY_JSON 包含受保护的请求字段。")
     return TeacherConfig(provider, base, key, model, api, max_tokens, timeout, retries,
                          proxy, token_field, extra)
 
