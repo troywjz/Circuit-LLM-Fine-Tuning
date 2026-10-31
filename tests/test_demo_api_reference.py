@@ -91,7 +91,7 @@ class TeacherMessagesTests(unittest.TestCase):
              "quota_billing", "教师接口额度或账单受限", 1, 300.0),
             (401, {"type": "authentication_error", "message": "sk-secret-private"},
              "auth", "教师接口认证或权限失败", 1, None),
-            (429, {"message": "opaque private diagnostic"}, "unknown", "教师接口请求失败", 3, 300.0),
+            (429, {"message": "opaque private diagnostic"}, "rate_limit", "教师接口限流", 3, 300.0),
         ]
         for status, detail, category, label, expected_calls, retry_seconds in cases:
             body = json.dumps({"error": detail}).encode()
