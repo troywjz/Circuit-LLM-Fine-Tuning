@@ -386,7 +386,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     parser.add_argument("--model-id", help="强参考模型 ID；账户余额模式默认使用环境配置")
-    parser.add_argument("--teacher-profile", choices=("primary", "backup"), default="primary",
+    parser.add_argument("--teacher-profile", choices=("primary", "backup", "tertiary"), default="primary",
                         help="强参考账户模式仅允许 primary profile")
     parser.add_argument("--run-label", default="claude-opus-5-5")
     parser.add_argument("--step0", type=int, default=0)
