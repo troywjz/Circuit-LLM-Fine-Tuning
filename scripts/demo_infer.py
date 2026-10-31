@@ -149,9 +149,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--adapter-path", type=Path)
     parser.add_argument("--model-path", type=Path, default=DEFAULT_MODEL_PATH)
-    # 开发集首批384-token回答常在结论前截断；统一给Base和FT更充分的生成余量。
+    # 开发集回答曾在384/1024-token处被截断，评分会被截断污染；统一给Base和FT更充分的生成余量。
     parser.add_argument("--seq-length", type=int, default=4096)
-    parser.add_argument("--max-new-tokens", type=int, default=1024)
+    parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--seed", type=int, default=3407)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--run-label", default="Base")

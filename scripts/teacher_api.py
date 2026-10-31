@@ -43,6 +43,7 @@ class TeacherConfig:
     proxy_url: str = ""
     openai_max_tokens_field: str = "max_completion_tokens"
     extra_body: dict[str, Any] = field(default_factory=dict)
+    user_agent: str = "CircuitLLM/0.1"
 
 
 _PLACEHOLDERS = {"", "your_api_key", "your-api-key", "replace_me", "changeme", "none", "null"}
@@ -185,7 +186,7 @@ def load_config(env_file: Path, *, require_credentials: bool = True,
     names = (
         "PROVIDER", "OPENAI_API", "BASE_URL", "API_KEY", "MODEL_ID",
         "MAX_OUTPUT_TOKENS", "TIMEOUT_SECONDS", "MAX_RETRIES", "PROXY_URL",
-        "OPENAI_MAX_TOKENS_FIELD", "EXTRA_BODY_JSON",
+        "OPENAI_MAX_TOKENS_FIELD", "EXTRA_BODY_JSON", "USER_AGENT",
     )
     for name in names:
         env_name = prefix + name
@@ -223,6 +224,9 @@ def load_config(env_file: Path, *, require_credentials: bool = True,
             raise TeacherError(f"live 调用需要有效的 {prefix}API_KEY。")
         if model.lower() in _PLACEHOLDERS:
             raise TeacherError(f"live 调用需要有效的 {prefix}MODEL_ID。")
+    user_agent = get("USER_AGENT", "CircuitLLM/0.1") or "CircuitLLM/0.1"
+    if len(user_agent) > 128 or any(ch in user_agent for ch in "\r\n"):
+        raise TeacherError(f"{prefix}USER_AGENT 长度或字符无效。")
     raw_extra = get("EXTRA_BODY_JSON", "{}") or "{}"
     try:
         extra = json.loads(raw_extra)
@@ -234,7 +238,7 @@ def load_config(env_file: Path, *, require_credentials: bool = True,
     if forbidden:
         raise TeacherError(f"{prefix}EXTRA_BODY_JSON 包含受保护的请求字段。")
     return TeacherConfig(provider, base, key, model, api, max_tokens, timeout, retries,
-                         proxy, token_field, extra)
+                         proxy, token_field, extra, user_agent)
 
 
 def endpoint_url(config: TeacherConfig) -> str:
@@ -407,7 +411,7 @@ def _call_teacher_body(config: TeacherConfig, body: dict[str, Any]) -> dict[str,
     except (TypeError, ValueError, UnicodeError):
         raise TeacherError("教师接口请求配置无法编码为 JSON。") from None
     headers = {"Content-Type": "application/json", "Accept": "application/json",
-               "User-Agent": "CircuitLLM/0.1"}
+               "User-Agent": getattr(config, "user_agent", "") or "CircuitLLM/0.1"}
     if config.provider == "anthropic":
         headers.update({"x-api-key": config.api_key, "anthropic-version": "2023-06-01"})
     else:
