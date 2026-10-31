@@ -51,6 +51,8 @@ _PROTECTED_EXTRA = {
     "model", "messages", "input", "instructions", "system", "stream",
     "max_tokens", "max_completion_tokens", "max_output_tokens",
 }
+# 三个备选接口按调用顺位命名：primary 第一，backup 第二，tertiary 第三。
+_PROFILES = {"primary": "TEACHER_", "backup": "TEACHER_BACKUP_", "tertiary": "TEACHER_TERTIARY_"}
 
 
 def _classify_http_error(exc: urllib.error.HTTPError) -> TeacherError:
@@ -83,6 +85,16 @@ def _classify_http_error(exc: urllib.error.HTTPError) -> TeacherError:
             category = "rate_limit"
     except (TypeError, ValueError, UnicodeError):
         pass
+    # 网关明确报告上游连不上时，请求根本没有送达模型，重发到另一条线路不会重复计费。
+    # 这一类 502 与"上游已处理但回传失败"的 502 必须分开，否则要么误重发、要么永远无法切换备选。
+    try:
+        probe = raw.decode("utf-8", errors="replace").lower()
+    except Exception:
+        probe = ""
+    if reason is None and any(word in probe for word in (
+            "connection refused", "connect failed", "econnrefused",
+            "no route to host", "无法连接", "积极拒绝")):
+        reason = "upstream_unreachable"
     if category == "unknown" and exc.code in {401, 403}:
         category = "auth"
     if category == "unknown" and exc.code == 402:
@@ -169,19 +181,18 @@ def load_profile_order(env_file: Path, case: str) -> tuple[str, ...]:
     else:
         raw = values.get(key, ",".join(defaults[case]))
     order = tuple(item.strip().lower() for item in raw.split(","))
-    if (not order or any(item not in {"primary", "backup"} for item in order)
+    if (not order or any(item not in _PROFILES for item in order)
             or len(set(order)) != len(order)):
-        raise TeacherError(f"{key} 只能是逗号分隔且不重复的 primary/backup。")
+        raise TeacherError(f"{key} 只能是逗号分隔且不重复的 primary/backup/tertiary。")
     return order
 
 
 def load_config(env_file: Path, *, require_credentials: bool = True,
                 profile: str = "primary") -> TeacherConfig:
-    """读取明确选择的API配置；主配置和备用配置互不混用。"""
-    prefixes = {"primary": "TEACHER_", "backup": "TEACHER_BACKUP_"}
-    if profile not in prefixes:
-        raise TeacherError("Teacher profile 只能是 primary 或 backup。")
-    prefix = prefixes[profile]
+    """读取明确选择的API配置；主配置、备用配置与第三顺位配置互不混用。"""
+    if profile not in _PROFILES:
+        raise TeacherError("Teacher profile 只能是 primary、backup 或 tertiary。")
+    prefix = _PROFILES[profile]
     values = _parse_env_file(Path(env_file))
     names = (
         "PROVIDER", "OPENAI_API", "BASE_URL", "API_KEY", "MODEL_ID",

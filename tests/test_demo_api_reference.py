@@ -14,7 +14,59 @@ import urllib.error
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import demo_api_reference as reference
-from teacher_api import TeacherConfig, TeacherError, call_teacher_messages
+from teacher_api import (TeacherConfig, TeacherError, call_teacher_messages,
+                         load_config, load_profile_order)
+
+
+class TeacherProfileTests(unittest.TestCase):
+    """三个备选接口的解析与顺序校验。"""
+
+    def _env(self, text: str) -> Path:
+        handle = tempfile.NamedTemporaryFile("w", suffix=".env", encoding="utf-8",
+                                             delete=False, newline="\n")
+        handle.write(text)
+        handle.close()
+        self.addCleanup(Path(handle.name).unlink)
+        return Path(handle.name)
+
+    def test_tertiary_profile_uses_its_own_prefix(self):
+        env = self._env(
+            "TEACHER_BASE_URL=https://primary.invalid/v1\n"
+            "TEACHER_API_KEY=primary-key-000\n"
+            "TEACHER_MODEL_ID=primary-model\n"
+            "TEACHER_TERTIARY_PROVIDER=openai\n"
+            "TEACHER_TERTIARY_OPENAI_API=chat_completions\n"
+            "TEACHER_TERTIARY_BASE_URL=https://tertiary.invalid/v1\n"
+            "TEACHER_TERTIARY_API_KEY=tertiary-key-111\n"
+            "TEACHER_TERTIARY_MODEL_ID=tertiary-model\n"
+        )
+        cfg = load_config(env, profile="tertiary")
+        # 三套配置互不混用：不能读到 primary 的地址、密钥或模型名。
+        self.assertEqual(cfg.base_url, "https://tertiary.invalid/v1")
+        self.assertEqual(cfg.model_id, "tertiary-model")
+        self.assertEqual(cfg.openai_api, "chat_completions")
+        self.assertEqual(cfg.provider, "openai")
+        self.assertNotIn("primary-key-000", repr(cfg))
+
+    def test_profile_order_accepts_three_positions(self):
+        env = self._env("TEACHER_PROFILE_ORDER_DATA=primary,backup,tertiary\n")
+        self.assertEqual(load_profile_order(env, "data"), ("primary", "backup", "tertiary"))
+
+    def test_profile_order_rejects_unknown_or_repeated_names(self):
+        for order in ("primary,backup,fourth", "primary,primary", "primary,"):
+            with self.subTest(order=order):
+                env = self._env(f"TEACHER_PROFILE_ORDER_DATA={order}\n")
+                with self.assertRaises(TeacherError):
+                    load_profile_order(env, "data")
+
+    def test_incomplete_tertiary_is_reported_by_name(self):
+        env = self._env(
+            "TEACHER_TERTIARY_PROVIDER=openai\n"
+            "TEACHER_TERTIARY_BASE_URL=https://tertiary.invalid/v1\n"
+        )
+        with self.assertRaises(TeacherError) as ctx:
+            load_config(env, profile="tertiary")
+        self.assertIn("TEACHER_TERTIARY_API_KEY", str(ctx.exception))
 
 
 class FakeResponse:

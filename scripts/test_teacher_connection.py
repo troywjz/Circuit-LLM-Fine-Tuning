@@ -121,8 +121,12 @@ def run(env_file: Path) -> int:
                                       "http_status": fallback_exc.http_status,
                                       "category": fallback_exc.category})
 
-            # 网络超时、5xx、额度耗尽和服务明确拒绝权限时，不换线路重发。
-            if (active_error.http_status is None or active_error.http_status >= 500
+            # 网络超时、额度耗尽和服务明确拒绝权限时不换线路重发（结果可能不明）。
+            # 以下两类可继续试下一顺位：503（服务端明确未受理）、网关明确报告上游连不上（请求没送达模型）。
+            unreachable = getattr(active_error, "reason", None) == "upstream_unreachable"
+            if (active_error.http_status is None
+                    or (active_error.http_status >= 500
+                        and active_error.http_status != 503 and not unreachable)
                     or active_error.category == "quota_billing" or active_error.http_status == 403):
                 break
 

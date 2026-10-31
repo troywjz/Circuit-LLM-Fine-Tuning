@@ -199,7 +199,7 @@ def main() -> int:
     prep.add_argument("--input",type=Path,default=DEFAULT_RAW); prep.add_argument("--reserved-file",type=Path,default=DEFAULT_RESERVED); prep.add_argument("--outdir",type=Path,default=DEFAULT_OUT); prep.add_argument("--limit",type=int); prep.add_argument("--domain-count",type=int,default=96); prep.add_argument("--validation-count",type=int,default=20); prep.add_argument("--general-count",type=int,default=20); prep.set_defaults(func=prepare)
     # live generation intentionally requires a separately reviewed source approval manifest.
     gen=sub.add_parser("generate", help="approved sourcepack rows only; live calls are bounded per request")
-    gen.add_argument("--input",type=Path,required=True); gen.add_argument("--approval-file",type=Path,required=True); gen.add_argument("--env-file",type=Path,default=ROOT/".env"); gen.add_argument("--outdir",type=Path,default=DEFAULT_OUT); gen.add_argument("--limit",type=int,default=20); gen.add_argument("--dry-run",action="store_true"); gen.add_argument("--resume",action="store_true",help="校验指纹后复用已有回复，并优先选择未完成项"); gen.add_argument("--review-notes",type=Path,help="可选的私有主Agent工程校注JSON"); gen.add_argument("--use-account-balance",action="store_true",help="使用账户实时余额，不设项目 cap/reserve；独立于旧预算账本"); gen.add_argument("--allow-unknown-balance",action="store_true",help="仅当 /usage 明确返回404/405/501时启用；改由服务端额度耗尽错误控制停止"); gen.add_argument("--allow-source-reuse",action="store_true",help="明确允许来源ID或来源组与历史本地数据重复；不绕过当前批次未决请求/账本停止规则"); gen.add_argument("--teacher-profile",choices=("primary","backup"),default=None,help="账户余额模式默认按 DATA profile 顺序选择；显式设置则仅尝试该 profile"); gen.set_defaults(func=generate)
+    gen.add_argument("--input",type=Path,required=True); gen.add_argument("--approval-file",type=Path,required=True); gen.add_argument("--env-file",type=Path,default=ROOT/".env"); gen.add_argument("--outdir",type=Path,default=DEFAULT_OUT); gen.add_argument("--limit",type=int,default=20); gen.add_argument("--dry-run",action="store_true"); gen.add_argument("--resume",action="store_true",help="校验指纹后复用已有回复，并优先选择未完成项"); gen.add_argument("--review-notes",type=Path,help="可选的私有主Agent工程校注JSON"); gen.add_argument("--use-account-balance",action="store_true",help="使用账户实时余额，不设项目 cap/reserve；独立于旧预算账本"); gen.add_argument("--allow-unknown-balance",action="store_true",help="仅当 /usage 明确返回404/405/501时启用；改由服务端额度耗尽错误控制停止"); gen.add_argument("--allow-source-reuse",action="store_true",help="明确允许来源ID或来源组与历史本地数据重复；不绕过当前批次未决请求/账本停止规则"); gen.add_argument("--teacher-profile",choices=("primary","backup","tertiary"),default=None,help="账户余额模式默认按 DATA profile 顺序选择；显式设置则仅尝试该 profile"); gen.set_defaults(func=generate)
     gen.add_argument("--max-sample-tokens",type=int,default=4096,help="账户余额模式候选对话的最大 token 数，超限保留原始回复并停下")
     gen.add_argument("--max-message-count",type=int,default=12,help="账户余额模式对话最多允许的消息数")
     gen.add_argument("--general-dialogue",action="store_true",help="账户余额模式使用通用对话整理提示，适合日常和编程等来源")
@@ -927,7 +927,7 @@ def _generate_account(args: argparse.Namespace) -> int:
                     status=getattr(exc,"http_status",None);category=getattr(exc,"category",None)
                     reason=getattr(exc,"reason",None)
                     if category not in {"quota_billing","auth","rate_limit","unknown"}: category="unknown"
-                    if reason!="insufficient_balance": reason=None
+                    if reason not in {"insufficient_balance","upstream_unreachable"}: reason=None
                     retry=getattr(exc,"retry_after_seconds",None)
                     if not isinstance(retry,(int,float)) or isinstance(retry,bool) or not math.isfinite(retry) or retry<0:
                         retry=None
@@ -942,8 +942,16 @@ def _generate_account(args: argparse.Namespace) -> int:
                         error=exc,completed_count=_account_progress(outdir,targets)["generated"],wallet_usd=post_balance)
                     definite=(isinstance(status,int) and not isinstance(status,bool)
                               and status in {400,401,402,403,404,413,422,429})
-                    can_fallback=(definite and status in {400,401,404,413,422}
-                                  and category!="quota_billing") or (
+                    # 503 是服务端明确表示"当前无法处理"（如上游账号池耗尽），请求未被受理；
+                    # 网关明确报"上游连不上"时请求也没送达模型。这两种换下一个 provider 重发不会重复计费。
+                    # 其余 502/504 上游可能已开始处理，不能重发。
+                    unavailable=(isinstance(status,int) and not isinstance(status,bool)
+                                 and status==503 and category!="quota_billing")
+                    unreachable=(isinstance(status,int) and not isinstance(status,bool)
+                                 and reason=="upstream_unreachable" and category!="quota_billing")
+                    can_fallback=(unavailable or unreachable
+                                  or (definite and status in {400,401,404,413,422}
+                                      and category!="quota_billing")) or (
                                       definite and status==429 and category=="rate_limit")
                     attempted_profiles.append({"profile":profile,"http_status":status,
                                                "category":category,"safe_rejection":bool(can_fallback)})
@@ -961,7 +969,7 @@ def _generate_account(args: argparse.Namespace) -> int:
                                    last_error_reason=reason,retry_after_seconds=retry,
                                    last_failed_sample_id=sid)
                         continue
-                    outcome="request_failed" if definite else "request_unknown"
+                    outcome="request_failed" if (definite or unavailable or unreachable) else "request_unknown"
                     if definite and category=="quota_billing": outcome="balance_insufficient"
                     save_state(outcome,running_sample_id=None if definite else sid,active_profile=profile,
                                last_balance=post_balance,last_error_category=category,
