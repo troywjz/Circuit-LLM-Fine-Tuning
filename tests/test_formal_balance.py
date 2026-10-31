@@ -310,6 +310,7 @@ class AccountBalanceSafetyTests(unittest.TestCase):
             exported = json.loads(output.read_text(encoding='utf-8'))
             self.assertEqual(exported['task'], row['task'])
             self.assertEqual(exported['evidence'], candidate['review']['evidence'])
+            self.assertEqual(exported['teacher'], candidate['teacher'])
             self.assertEqual(exported['messages'], candidate['messages'])
 
     def test_general_dialogue_uses_original_conversation_and_own_fingerprint(self):

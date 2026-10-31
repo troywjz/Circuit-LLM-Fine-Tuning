@@ -227,7 +227,7 @@ def export_approved(args: argparse.Namespace) -> int:
         if row.get("review",{}).get("status") not in {"approved","approved_for_demo"}:
             raise BuildError(f"候选尚未通过内容审核：{row.get('sample_id','unknown')}")
         _validate_training_messages(row.get("sample_id","unknown"),messages,max_messages=getattr(args,"max_message_count",7))
-        exported.append({"sample_id":row["sample_id"],"source_id":row["source_id"],"group_id":row["group_id"],"project_id":row.get("project_id"),"task":row.get("task"),"split":row["split"],"messages":messages,"sources":row.get("sources",[]),"evidence":row.get("review",{}).get("evidence"),"modifications":row.get("modifications",[]),"approved_by":args.approved_by,"approved_for_demo":True})
+        exported.append({"sample_id":row["sample_id"],"source_id":row["source_id"],"group_id":row["group_id"],"project_id":row.get("project_id"),"task":row.get("task"),"split":row["split"],"messages":messages,"sources":row.get("sources",[]),"evidence":row.get("review",{}).get("evidence"),"teacher":row.get("teacher"),"provenance":{name:row.get(name) for name in ("row_hash","prompt_hash","config_fingerprint","review_note_hash")},"modifications":row.get("modifications",[]),"approved_by":args.approved_by,"approved_for_demo":True})
     if not exported: raise BuildError("没有可导出的审核候选")
     args.output.parent.mkdir(parents=True,exist_ok=True)
     content="".join(json.dumps(x,ensure_ascii=False)+"\n" for x in exported)
