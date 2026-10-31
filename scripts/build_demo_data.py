@@ -1007,7 +1007,8 @@ def _wallet(config) -> float | None:
         path=path.rsplit("/",1)[0]
     usage_path=path+"/usage" if path.endswith("/v1") else (path+"/v1/usage" if path else "/v1/usage")
     url=urlunsplit((parts.scheme,parts.netloc,usage_path,"",""))
-    request=Request(url,headers={"Authorization":"Bearer "+config.api_key,"Accept":"application/json","User-Agent":"CircuitLLM/0.1"})
+    request=Request(url,headers={"Authorization":"Bearer "+config.api_key,"Accept":"application/json",
+                                 "User-Agent":getattr(config,"user_agent","") or "CircuitLLM/0.1"})
     try:
         handlers=[ProxyHandler({})] if (parts.hostname or "").lower() in {"localhost","127.0.0.1","::1"} else [ProxyHandler({"http":config.proxy_url,"https":config.proxy_url})] if config.proxy_url else [ProxyHandler()]
         with build_opener(_NoRedirect(),*handlers).open(request,timeout=min(config.timeout_seconds,30)) as response: data=json.loads(response.read().decode("utf-8"))

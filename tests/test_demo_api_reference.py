@@ -78,6 +78,14 @@ class TeacherMessagesTests(unittest.TestCase):
                 self.assertEqual(body["system"], "neutral system")
                 self.assertEqual(body["messages"], messages[1:])
 
+    def test_user_agent_is_configurable_for_gateways(self):
+        cfg = config(api="chat_completions")
+        cfg.user_agent = "UnitTest UA/1.0"
+        opener = FakeOpener({"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]})
+        with patch("teacher_api.urllib.request.build_opener", return_value=opener):
+            call_teacher_messages(cfg, [{"role": "user", "content": "q"}])
+        self.assertEqual(opener.requests[0].get_header("User-agent"), "UnitTest UA/1.0")
+
     def test_rejects_invalid_role_history(self):
         with self.assertRaises(TeacherError):
             call_teacher_messages(config(), [{"role": "user", "content": "q"},
