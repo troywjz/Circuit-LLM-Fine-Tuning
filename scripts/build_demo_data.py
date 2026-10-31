@@ -199,7 +199,7 @@ def main() -> int:
     prep.add_argument("--input",type=Path,default=DEFAULT_RAW); prep.add_argument("--reserved-file",type=Path,default=DEFAULT_RESERVED); prep.add_argument("--outdir",type=Path,default=DEFAULT_OUT); prep.add_argument("--limit",type=int); prep.add_argument("--domain-count",type=int,default=96); prep.add_argument("--validation-count",type=int,default=20); prep.add_argument("--general-count",type=int,default=20); prep.set_defaults(func=prepare)
     # live generation intentionally requires a separately reviewed source approval manifest.
     gen=sub.add_parser("generate", help="approved sourcepack rows only; live calls are bounded per request")
-    gen.add_argument("--input",type=Path,required=True); gen.add_argument("--approval-file",type=Path,required=True); gen.add_argument("--env-file",type=Path,default=ROOT/".env"); gen.add_argument("--outdir",type=Path,default=DEFAULT_OUT); gen.add_argument("--limit",type=int,default=20); gen.add_argument("--dry-run",action="store_true"); gen.add_argument("--resume",action="store_true",help="校验指纹后复用已有回复，并优先选择未完成项"); gen.add_argument("--review-notes",type=Path,help="可选的私有主Agent工程校注JSON"); gen.add_argument("--use-account-balance",action="store_true",help="使用账户实时余额，不设项目 cap/reserve；独立于旧预算账本"); gen.add_argument("--allow-unknown-balance",action="store_true",help="仅当 /usage 明确返回404/405/501时启用；改由服务端额度耗尽错误控制停止"); gen.add_argument("--teacher-profile",choices=("primary","backup"),default=None,help="账户余额模式默认按 DATA profile 顺序选择；显式设置则仅尝试该 profile"); gen.set_defaults(func=generate)
+    gen.add_argument("--input",type=Path,required=True); gen.add_argument("--approval-file",type=Path,required=True); gen.add_argument("--env-file",type=Path,default=ROOT/".env"); gen.add_argument("--outdir",type=Path,default=DEFAULT_OUT); gen.add_argument("--limit",type=int,default=20); gen.add_argument("--dry-run",action="store_true"); gen.add_argument("--resume",action="store_true",help="校验指纹后复用已有回复，并优先选择未完成项"); gen.add_argument("--review-notes",type=Path,help="可选的私有主Agent工程校注JSON"); gen.add_argument("--use-account-balance",action="store_true",help="使用账户实时余额，不设项目 cap/reserve；独立于旧预算账本"); gen.add_argument("--allow-unknown-balance",action="store_true",help="仅当 /usage 明确返回404/405/501时启用；改由服务端额度耗尽错误控制停止"); gen.add_argument("--allow-source-reuse",action="store_true",help="明确允许来源ID或来源组与历史本地数据重复；不绕过当前批次未决请求/账本停止规则"); gen.add_argument("--teacher-profile",choices=("primary","backup"),default=None,help="账户余额模式默认按 DATA profile 顺序选择；显式设置则仅尝试该 profile"); gen.set_defaults(func=generate)
     gen.add_argument("--max-sample-tokens",type=int,default=4096,help="账户余额模式候选对话的最大 token 数，超限保留原始回复并停下")
     gen.add_argument("--max-message-count",type=int,default=12,help="账户余额模式对话最多允许的消息数")
     gen.add_argument("--general-dialogue",action="store_true",help="账户余额模式使用通用对话整理提示，适合日常和编程等来源")
@@ -414,8 +414,14 @@ def _account_targets(args: argparse.Namespace) -> list[dict[str,Any]]:
     if args.limit < 1 or args.limit > 20: raise BuildError("--limit 必须在1到20之间")
     permitted=set(source_ids)
     rows=[r for r in read_jsonl(args.input) if r.get("source_id") in permitted]
-    if {r.get("source_id") for r in rows}!=permitted: raise BuildError("审批清单包含输入中不存在的 source_id")
+    row_source_ids=[r.get("source_id") for r in rows]
+    if len(row_source_ids)!=len(set(row_source_ids)):
+        raise BuildError("同一批次包含重复 source_id；未发送 API 请求")
+    if {r.get("source_id") for r in rows}!=permitted:
+        raise BuildError("审批清单包含输入中不存在的 source_id；未发送 API 请求")
     seen:set[str]=set()
+    seen_sources:set[str]=set()
+    seen_groups:set[str]=set()
     split_groups:dict[tuple[str,str],str]={}
     for row in rows:
         sample=row.get("sample_id"); source=row.get("source_id"); group=row.get("group_id"); split=row.get("split")
@@ -423,8 +429,12 @@ def _account_targets(args: argparse.Namespace) -> list[dict[str,Any]]:
             or sample.casefold() in seen or not isinstance(source,str)
             or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}",source)):
             raise BuildError("批次 sample_id/source_id 无效或重复")
+        if source in seen_sources:
+            raise BuildError("批次包含重复 source_id；未发送 API 请求")
         if not isinstance(group,str) or not group or split not in {"train","validation"}:
             raise BuildError("批次 group_id/split 无效；最终测试来源不可进入该批次")
+        if group in seen_groups:
+            raise BuildError("批次包含重复 group_id；未发送 API 请求")
         for name,value in (("group_id",group),("project_id",row.get("project_id"))):
             if value is None and name=="project_id": continue
             if not isinstance(value,str) or not value: raise BuildError(f"批次 {name} 无效")
@@ -433,15 +443,147 @@ def _account_targets(args: argparse.Namespace) -> list[dict[str,Any]]:
                 raise BuildError("同一来源组或项目跨训练与开发集合")
             split_groups[key]=split
         seen.add(sample.casefold())
+        seen_sources.add(source)
+        seen_groups.add(group)
     return rows
 
 
 def generate(args: argparse.Namespace) -> int:
     """旧预算模式沿用原流程；账户余额模式使用独立的安全流程。"""
-    if getattr(args, "use_account_balance", False) and not args.dry_run:
+    if getattr(args, "use_account_balance", False):
+        rows = _account_targets(args)
+        _check_eval_source_isolation(rows)
+        if args.dry_run:
+            done = _candidate_ids(args.outdir)
+            selected = [r for r in rows if r["sample_id"] not in done][:args.limit]
+            _check_cross_batch_reuse(args, selected)
+            print(f"dry-run：计划选择 {len(selected)} 条待生成来源；不会读取凭据、查询余额或调用 API。")
+            return 0
         with _account_generation_lock(args.outdir):
             return _generate_account(args)
     return _generate_legacy(args)
+
+
+def _check_cross_batch_reuse(args: argparse.Namespace, rows: list[dict[str, Any]]) -> None:
+    """请求前检查训练候选、历史批次候选和其他批次来源包。"""
+    allow_source_reuse = getattr(args, "allow_source_reuse", False)
+    input_path = os.path.normcase(str(args.input.resolve()))
+    outdir = os.path.normcase(str(args.outdir.resolve()))
+    root = ROOT / "本地资料" / "正式实验"
+    seen_samples: set[str] = set()
+    seen_sources: set[str] = set()
+    seen_groups: set[str] = set()
+
+    def scan(path: Path) -> None:
+        if not path.is_file() or os.path.normcase(str(path.resolve())) == input_path:
+            return
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            old = json.loads(line)
+            sample_id = old.get("sample_id")
+            sid, gid = old.get("source_id"), old.get("group_id")
+            if isinstance(sample_id, str) and sample_id:
+                seen_samples.add(sample_id)
+            if isinstance(sid, str) and sid:
+                seen_sources.add(sid)
+            if isinstance(gid, str) and gid:
+                seen_groups.add(gid)
+
+    for path in (root / "训练").glob("训练集候选-部分-v*.jsonl"):
+        scan(path)
+    for path in (root / "训练").glob("*已审*.jsonl"):
+        scan(path)
+    batch_root = root / "批次"
+    if batch_root.exists():
+        for path in batch_root.rglob("来源包.jsonl"):
+            scan(path)
+        for path in batch_root.rglob("train_candidates.jsonl"):
+            resolved = os.path.normcase(str(path.resolve()))
+            if resolved.startswith(outdir + os.sep):
+                continue
+            scan(path)
+    repeated_samples = sorted({str(r.get("sample_id")) for r in rows
+                               if r.get("sample_id") in seen_samples})
+    if repeated_samples:
+        raise BuildError(f"发现 {len(repeated_samples)} 个 sample_id 重复；拒绝整理："
+                         + ", ".join(repeated_samples[:10]))
+    if not allow_source_reuse:
+        repeated_sources = sorted({str(r.get("sample_id") or r.get("source_id")) for r in rows
+                                   if r.get("source_id") in seen_sources
+                                   or r.get("group_id") in seen_groups})
+        if repeated_sources:
+            raise BuildError(f"发现 {len(repeated_sources)} 个 source_id/group_id 重复；拒绝整理："
+                             + ", ".join(repeated_sources[:10])
+                             + "。如确需复用，请显式加 --allow-source-reuse。")
+
+
+def _check_eval_source_isolation(rows: list[dict[str, Any]]) -> None:
+    """冻结开发/终测只读取身份字段；题文、对话和评分字段会在解析时丢弃。"""
+    private_root = ROOT / "本地资料" / "正式实验"
+    eval_paths = (
+        private_root / "评测" / "开发集-冻结-v1.jsonl",
+        private_root / "评测" / "终测集-冻结-v1.jsonl",
+    )
+    allowed_ids = {"sample_id", "source_id", "group_id", "project_id",
+                   "message_tree_id", "message_id", "message_ids"}
+    identity_keys = allowed_ids | {
+        "sources", "dataset", "revision", "row_index", "source_row_index",
+    }
+    eval_ids: set[str] = set()
+    eval_source_rows: set[tuple[str, str, str]] = set()
+
+    def keep_identity_pairs(pairs):
+        return {key: value for key, value in pairs if key in identity_keys}
+
+    def identity_values(value: dict[str, Any]) -> set[str]:
+        found = {value[key] for key in allowed_ids
+                 if isinstance(value.get(key), str) and value.get(key)}
+        message_ids = value.get("message_ids")
+        if isinstance(message_ids, list):
+            found.update(item for item in message_ids if isinstance(item, str) and item)
+        return found
+
+    def collect_source_entry(value: Any) -> None:
+        if isinstance(value, dict):
+            dataset, revision = value.get("dataset"), value.get("revision")
+            row_index = value.get("row_index", value.get("source_row_index"))
+            if isinstance(dataset, str) and isinstance(revision, str) and row_index is not None:
+                eval_source_rows.add((dataset, revision, str(row_index)))
+            eval_ids.update(identity_values(value))
+
+    for path in eval_paths:
+        if not path.is_file():
+            raise BuildError("冻结开发/终测来源清单缺失；为保护评测隔离，未发送 API 请求")
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    eval_row = json.loads(line, object_pairs_hook=keep_identity_pairs)
+                    eval_ids.update(identity_values(eval_row))
+                    source_entries = eval_row.get("sources")
+                    if isinstance(source_entries, list):
+                        for entry in source_entries:
+                            collect_source_entry(entry)
+        except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+            raise BuildError("冻结开发/终测来源清单不可读取；为保护评测隔离，未发送 API 请求") from None
+
+    for row in rows:
+        candidate_ids = identity_values(row)
+        source_entries = row.get("sources") if isinstance(row.get("sources"), list) else []
+        candidate_source_rows: set[tuple[str, str, str]] = set()
+        for entry in source_entries:
+            if isinstance(entry, dict):
+                candidate_ids.update(identity_values(entry))
+        for value in [row, *source_entries]:
+            if not isinstance(value, dict):
+                continue
+            dataset = value.get("dataset") or value.get("source_dataset")
+            revision = value.get("revision")
+            row_index = value.get("row_index", value.get("source_row_index"))
+            if isinstance(dataset, str) and isinstance(revision, str) and row_index is not None:
+                candidate_source_rows.add((dataset, revision, str(row_index)))
+        if candidate_ids & eval_ids or candidate_source_rows & eval_source_rows:
+            raise BuildError("来源与冻结开发集或终测集重叠；为保护评测隔离，未发送 API 请求")
 
 
 def _generate_legacy(args: argparse.Namespace) -> int:
@@ -564,6 +706,7 @@ def _generate_account(args: argparse.Namespace) -> int:
     """按账户实际余额整理一批候选；保留可核对的状态，遇异常不盲目重发。"""
     from teacher_api import TeacherError,call_teacher,load_config,load_profile_order
     rows=_account_targets(args)
+    _check_eval_source_isolation(rows)
     targets={r["sample_id"]:r for r in rows}
     general=getattr(args,"general_dialogue",False)
     system_prompt=FORMAL_GENERAL_SYSTEM_PROMPT if general else FORMAL_SYSTEM_PROMPT
@@ -687,6 +830,7 @@ def _generate_account(args: argparse.Namespace) -> int:
         previous=state.get("running_sample_id")
         pending.sort(key=lambda r: r["sample_id"]!=previous)
     selected=pending[:args.limit]
+    _check_cross_batch_reuse(args, selected)
     if not selected:
         save_state("generation_complete",running_sample_id=None)
         print("本批教师候选已全部生成；审核进度以账户账本为准。")
