@@ -86,6 +86,9 @@ def _classify_http_error(exc: urllib.error.HTTPError) -> TeacherError:
         category = "auth"
     if category == "unknown" and exc.code == 402:
         category = "quota_billing"
+    # HTTP 429明确表示请求被限流；只有错误正文明确包含额度/账单词时才归为 quota。
+    if category == "unknown" and exc.code == 429:
+        category = "rate_limit"
     retry_after = None
     if exc.code == 429 and exc.headers is not None:
         try:
