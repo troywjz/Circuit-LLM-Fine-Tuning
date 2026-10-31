@@ -203,6 +203,7 @@ def main() -> int:
     gen.add_argument("--max-sample-tokens",type=int,default=4096,help="账户余额模式候选对话的最大 token 数，超限保留原始回复并停下")
     gen.add_argument("--max-message-count",type=int,default=12,help="账户余额模式对话最多允许的消息数")
     gen.add_argument("--general-dialogue",action="store_true",help="账户余额模式使用通用对话整理提示，适合日常和编程等来源")
+    gen.add_argument("--balance-endpoint-disabled",action="store_true",help="服务方不提供余额查询时启用：完全不请求 /usage，仅由服务端额度或账单错误停止")
     approve=sub.add_parser("approve",help="由主Agent审核后写入明确许可的source_id")
     approve.add_argument("--approval-file",type=Path,required=True); approve.add_argument("--source-id",action="append",required=True); approve.add_argument("--reviewer",required=True); approve.set_defaults(func=approve_ids)
     export=sub.add_parser("export",help="显式审核并导出正式训练messages")
@@ -357,16 +358,31 @@ def _write_call_failure(path: Path, *, source_id: str, row_sha256: str, prompt_s
 
 @contextmanager
 def _account_generation_lock(outdir: Path):
-    """同一目录同时只运行一个账户余额批次，异常退出也只释放自己的锁。"""
+    """同一目录同时只运行一个账户余额批次，异常退出也只释放自己的锁。
+
+    默认只允许一个数据整理任务；显式设置 FORMAL_TEACHER_SLOTS=2..4 时按槽位并发，
+    用于多批次并行整理，仍保证同一时刻不超过设定的请求数。
+    """
     private_root=(ROOT/"本地资料").resolve()
     target=outdir.resolve()
     try: target.relative_to(private_root)
     except ValueError: raise BuildError("账户余额模式的输出必须位于本地资料目录") from None
     target.mkdir(parents=True,exist_ok=True)
-    path=private_root/".formal_teacher_api.lock"
+    try:
+        slots=int(os.environ.get("FORMAL_TEACHER_SLOTS","1"))
+    except ValueError:
+        raise BuildError("FORMAL_TEACHER_SLOTS 必须是 1 到 4 的整数") from None
+    if not 1<=slots<=4: raise BuildError("FORMAL_TEACHER_SLOTS 必须是 1 到 4 的整数")
+    names=[private_root/".formal_teacher_api.lock"] if slots==1 else [
+        private_root/f".formal_teacher_api.lock.{index}" for index in range(1,slots+1)]
     lock_id=uuid.uuid4().hex
-    try: fd=os.open(path,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
-    except FileExistsError: raise BuildError("已有账户余额任务或遗留锁；请先核对任务状态") from None
+    path=None
+    for candidate in names:
+        try: fd=os.open(candidate,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
+        except FileExistsError: continue
+        path=candidate
+        break
+    if path is None: raise BuildError("已有账户余额任务或遗留锁；请先核对任务状态")
     try:
         with os.fdopen(fd,"w",encoding="utf-8") as stream:
             json.dump({"pid":os.getpid(),"lock_id":lock_id},stream)
@@ -738,6 +754,7 @@ def _generate_account(args: argparse.Namespace) -> int:
     outdir=args.outdir.resolve()
     if (outdir/".teacher_budget.json").exists():
         raise BuildError("检测到旧预算账本；账户余额模式请使用独立输出目录")
+    balance_disabled=bool(getattr(args,"balance_endpoint_disabled",False))
     notes=_load_review_notes(args.review_notes) if getattr(args,"review_notes",None) is not None else None
     # 运行指纹覆盖完整的候选顺序与各 profile 指纹；不会记录 API 地址或密钥。
     profile_fingerprints={name:_config_fingerprint(cfg,system_prompt=system_prompt)
@@ -746,6 +763,7 @@ def _generate_account(args: argparse.Namespace) -> int:
                                   "profiles":profile_fingerprints,"profile_order":list(order),
                                   "max_sample_tokens":max_tokens,"max_message_count":max_messages,
                                   "allow_unknown_balance":bool(getattr(args,"allow_unknown_balance",False)),
+                                  "balance_endpoint_disabled":balance_disabled,
                                   "review_notes":notes}))
     ledger=outdir/".teacher_account_balance_run.json"
     results=outdir/"teacher_raw"
@@ -838,6 +856,12 @@ def _generate_account(args: argparse.Namespace) -> int:
     _ensure_tokenizer()
 
     def balance_or_stop(active_config, saved_reply: bool = False) -> float | None:
+        # 服务方明确不提供余额查询时，不请求 /usage；结束后仍由服务端额度或账单错误停止。
+        if balance_disabled:
+            state["balance_tracking"]="stop_on_provider_quota_error"
+            save_state("balance_unmetered",last_balance=None,
+                       balance_error_category="balance_endpoint_disabled",balance_error_http_status=None)
+            return None
         balance_status=None
         balance_category=None
         try: balance=_wallet(active_config)
@@ -907,8 +931,10 @@ def _generate_account(args: argparse.Namespace) -> int:
                     retry=getattr(exc,"retry_after_seconds",None)
                     if not isinstance(retry,(int,float)) or isinstance(retry,bool) or not math.isfinite(retry) or retry<0:
                         retry=None
-                    try: post_balance=_wallet(config)
-                    except BuildError: post_balance=None
+                    post_balance=None
+                    if not balance_disabled:
+                        try: post_balance=_wallet(config)
+                        except BuildError: post_balance=None
                     if not isinstance(post_balance,(int,float)) or isinstance(post_balance,bool) or not math.isfinite(post_balance):
                         post_balance=None
                     _write_call_failure(outdir/"调用失败.json",source_id=row["source_id"],row_sha256=row_hash,

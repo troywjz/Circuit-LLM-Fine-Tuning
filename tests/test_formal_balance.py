@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -321,6 +322,41 @@ class AccountBalanceSafetyTests(unittest.TestCase):
                              ('balance_unknown','http_error',503))
             self.assertEqual((ledger['generated'],ledger['pending_generation']),(0,1))
 
+    def test_balance_endpoint_disabled_skips_wallet_and_generates(self):
+        with tempfile.TemporaryDirectory() as temp:
+            args,_,api=_inputs(Path(temp));calls=[]
+            args.balance_endpoint_disabled=True
+            api.call_teacher=lambda *a:(calls.append('POST') or _reply('source-1'))
+            with patch.object(demo,'ROOT',Path(temp)),patch.dict(sys.modules,{'teacher_api':api}), \
+                    patch.object(demo,'_wallet',side_effect=AssertionError('不应请求余额接口')), \
+                    patch.object(demo,'_ensure_tokenizer'),patch.object(demo,'_token_count',return_value=20):
+                self.assertEqual(demo.generate(args),0)
+            ledger=json.loads((args.outdir/'.teacher_account_balance_run.json').read_text(encoding='utf-8'))
+            self.assertEqual((ledger['status'],ledger['generated'],ledger['pending_generation']),
+                             ('generation_complete',1,0))
+            self.assertEqual(ledger['balance_error_category'],'balance_endpoint_disabled')
+            self.assertEqual(calls,['POST'])
+
+    def test_balance_endpoint_disabled_still_stops_on_quota_error(self):
+        with tempfile.TemporaryDirectory() as temp:
+            args,_,api=_inputs(Path(temp));calls=[]
+            args.balance_endpoint_disabled=True
+            error=api.TeacherError('额度受限')
+            error.http_status=402;error.category='quota_billing'
+            error.reason='insufficient_balance';error.retry_after_seconds=None
+            def fail(*a):
+                calls.append('POST')
+                raise error
+            api.call_teacher=fail
+            with patch.object(demo,'ROOT',Path(temp)),patch.dict(sys.modules,{'teacher_api':api}), \
+                    patch.object(demo,'_wallet',side_effect=AssertionError('不应请求余额接口')), \
+                    patch.object(demo,'_ensure_tokenizer'),patch.object(demo,'_token_count',return_value=20):
+                with self.assertRaisesRegex(demo.BuildError,'quota_billing'):
+                    demo.generate(args)
+            ledger=json.loads((args.outdir/'.teacher_account_balance_run.json').read_text(encoding='utf-8'))
+            self.assertEqual((ledger['status'],ledger['generated']),('balance_insufficient',0))
+            self.assertEqual(calls,['POST'])
+
     def test_saved_reply_is_recovered_after_interruption_before_ledger_update(self):
         with tempfile.TemporaryDirectory() as temp:
             args,_,api=_inputs(Path(temp));calls=[]
@@ -350,6 +386,18 @@ class AccountBalanceSafetyTests(unittest.TestCase):
             with patch.object(demo,'ROOT',root),patch.dict(sys.modules,{'teacher_api':api}):
                 with self.assertRaisesRegex(demo.BuildError,'已有账户余额任务'):demo.generate(args)
             self.assertTrue(lock.is_file())
+
+    def test_concurrency_slots_allow_bounded_parallel_batches(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);args,_,api=_inputs(root);private=root/'本地资料';private.mkdir(exist_ok=True)
+            (private/'.formal_teacher_api.lock.1').write_text('{"pid":1}',encoding='utf-8')
+            api.call_teacher=lambda *a:_reply('source-1')
+            with patch.dict(os.environ,{'FORMAL_TEACHER_SLOTS':'2'}),patch.object(demo,'ROOT',root), \
+                    patch.dict(sys.modules,{'teacher_api':api}),patch.object(demo,'_wallet',return_value=5), \
+                    patch.object(demo,'_ensure_tokenizer'),patch.object(demo,'_token_count',return_value=20):
+                self.assertEqual(demo.generate(args),0)
+            self.assertFalse((private/'.formal_teacher_api.lock.2').exists())
+            self.assertTrue((private/'.formal_teacher_api.lock.1').is_file())
 
     def test_formal_multiturn_limit_keeps_complete_messages(self):
         with tempfile.TemporaryDirectory() as temp:
