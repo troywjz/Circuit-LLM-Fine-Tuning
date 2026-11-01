@@ -296,6 +296,80 @@ class AccountBalanceSafetyTests(unittest.TestCase):
             self.assertEqual((ledger['status'],ledger['total'],ledger['generated'],ledger['pending_generation']),
                              ('balance_insufficient',1,0,1))
 
+    def test_explicit_insufficient_balance_falls_back_to_next_profile(self):
+        with tempfile.TemporaryDirectory() as temp:
+            args,_,api=_inputs(Path(temp)); calls=[]
+            configs={name:SimpleNamespace(provider='test',base_url=f'https://{name}.example/v1',
+                model_id=f'{name}-model',openai_api='responses',api_key=f'{name}-key',
+                max_retries=0,max_output_tokens=128,profile=name)
+                for name in ('backup','primary','tertiary')}
+            api.load_config=lambda path,profile='primary':configs[profile]
+            error=api.TeacherError('safe failure')
+            error.http_status=403;error.category='quota_billing';error.reason='insufficient_balance'
+            def call(config,*_args):
+                calls.append(config.profile)
+                if config.profile=='backup': raise error
+                return _reply('source-1')
+            api.call_teacher=call
+            with patch.object(demo,'ROOT',Path(temp)),patch.dict(sys.modules,{'teacher_api':api}), \
+                    patch.object(demo,'_wallet',return_value=5),patch.object(demo,'_ensure_tokenizer'), \
+                    patch.object(demo,'_token_count',return_value=20):
+                self.assertEqual(demo.generate(args),0)
+            self.assertEqual(calls,['backup','primary'])
+            ledger=json.loads((args.outdir/'.teacher_account_balance_run.json').read_text(encoding='utf-8'))
+            self.assertEqual(ledger['status'],'generation_complete')
+            self.assertEqual(ledger['profile_attempts'][0]['failed_profile'],'backup')
+            self.assertEqual(ledger['profile_attempts'][0]['next_profile'],'primary')
+            candidate=json.loads((args.outdir/'train_candidates.jsonl').read_text(encoding='utf-8'))
+            self.assertEqual(candidate['teacher_profile'],'primary')
+
+    def test_generic_quota_billing_falls_back_to_independent_profile(self):
+        with tempfile.TemporaryDirectory() as temp:
+            args,_,api=_inputs(Path(temp)); calls=[]
+            configs={name:SimpleNamespace(provider='test',base_url=f'https://{name}.example/v1',
+                model_id=f'{name}-model',openai_api='responses',api_key=f'{name}-key',
+                max_retries=0,max_output_tokens=128,profile=name)
+                for name in ('backup','primary','tertiary')}
+            api.load_config=lambda path,profile='primary':configs[profile]
+            error=api.TeacherError('safe failure')
+            error.http_status=403;error.category='quota_billing';error.reason=None
+            def call(config,*_args):
+                calls.append(config.profile)
+                if config.profile=='backup': raise error
+                return _reply('source-1')
+            api.call_teacher=call
+            with patch.object(demo,'ROOT',Path(temp)),patch.dict(sys.modules,{'teacher_api':api}), \
+                    patch.object(demo,'_wallet',return_value=5),patch.object(demo,'_ensure_tokenizer'), \
+                    patch.object(demo,'_token_count',return_value=20):
+                self.assertEqual(demo.generate(args),0)
+            self.assertEqual(calls,['backup','primary'])
+            ledger=json.loads((args.outdir/'.teacher_account_balance_run.json').read_text(encoding='utf-8'))
+            self.assertEqual(ledger['status'],'generation_complete')
+            self.assertEqual(ledger['profile_attempts'][0]['failed_profile'],'backup')
+            self.assertEqual(ledger['profile_attempts'][0]['next_profile'],'primary')
+            candidate=json.loads((args.outdir/'train_candidates.jsonl').read_text(encoding='utf-8'))
+            self.assertEqual(candidate['teacher_profile'],'primary')
+
+    def test_quota_billing_does_not_repeat_same_endpoint_and_account(self):
+        with tempfile.TemporaryDirectory() as temp:
+            args,_,api=_inputs(Path(temp)); calls=[]
+            same=SimpleNamespace(provider='test',base_url='https://same.example/v1',
+                model_id='model',openai_api='responses',api_key='same-key',
+                max_retries=0,max_output_tokens=128)
+            api.load_config=lambda path,profile='primary':same
+            error=api.TeacherError('safe failure')
+            error.http_status=403;error.category='quota_billing';error.reason='insufficient_balance'
+            def call(*_args):
+                calls.append('POST')
+                raise error
+            api.call_teacher=call
+            with patch.object(demo,'ROOT',Path(temp)),patch.dict(sys.modules,{'teacher_api':api}), \
+                    patch.object(demo,'_wallet',return_value=5),patch.object(demo,'_ensure_tokenizer'):
+                with self.assertRaises(demo.BuildError): demo.generate(args)
+            self.assertEqual(calls,['POST'])
+            ledger=json.loads((args.outdir/'.teacher_account_balance_run.json').read_text(encoding='utf-8'))
+            self.assertEqual(ledger['status'],'balance_insufficient')
+
     def test_wallet_failure_after_success_keeps_candidate(self):
         with tempfile.TemporaryDirectory() as temp:
             args,_,api=_inputs(Path(temp));calls=[]
