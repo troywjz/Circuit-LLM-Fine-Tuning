@@ -952,13 +952,18 @@ def _generate_account(args: argparse.Namespace) -> int:
                     can_fallback=(unavailable or unreachable
                                   or (definite and status in {400,401,404,413,422}
                                       and category!="quota_billing")) or (
-                                      definite and status==429 and category=="rate_limit")
+                                      definite and status==429 and category=="rate_limit") or (
+                                      definite and category=="quota_billing")
                     attempted_profiles.append({"profile":profile,"http_status":status,
                                                "category":category,"safe_rejection":bool(can_fallback)})
                     next_profile=None
                     if can_fallback:
+                        # Quota/账单拒绝只尝试不同端点或不同密钥，避免把共享账户当成多条额度。
                         next_profile=next((name for name in order[order.index(profile)+1:]
-                                           if name in configs),None)
+                                           if name in configs and (
+                                               category!="quota_billing"
+                                               or configs[name].base_url!=config.base_url
+                                               or configs[name].api_key!=config.api_key)),None)
                     if next_profile is not None:
                         state.setdefault("profile_attempts",[]).append({"sample_id":sid,
                             "failed_profile":profile,"next_profile":next_profile,
@@ -970,7 +975,8 @@ def _generate_account(args: argparse.Namespace) -> int:
                                    last_failed_sample_id=sid)
                         continue
                     outcome="request_failed" if (definite or unavailable or unreachable) else "request_unknown"
-                    if definite and category=="quota_billing": outcome="balance_insufficient"
+                    if definite and category=="quota_billing" and reason=="insufficient_balance":
+                        outcome="balance_insufficient"
                     save_state(outcome,running_sample_id=None if definite else sid,active_profile=profile,
                                last_balance=post_balance,last_error_category=category,
                                last_http_status=status if isinstance(status,int) else None,
