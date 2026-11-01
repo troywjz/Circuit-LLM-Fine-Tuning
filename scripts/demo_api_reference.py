@@ -186,7 +186,9 @@ def _run_account(args, cases: list[dict], cases_hash: str) -> int:
     args.effective_teacher_profile = profile
     for case in cases:
         roles = [m["role"] for m in case["input_messages"]]
-        if roles not in (["user"], ["system", "user"]):
+        # 冻结的多轮题可带有学生提供的既有 assistant 历史；_read_cases 已白名单化并剥离评分/答案等字段。
+        if (not getattr(args, "allow_student_history", False)
+                and roles not in (["user"], ["system", "user"])):
             raise DemoDataError("强参考的初始消息只能包含学生材料；后续回答使用本模型自己的历史")
     try:
         config = load_config(args.env_file) if profile == "primary" else load_config(args.env_file, profile=profile)
@@ -392,6 +394,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--step0", type=int, default=0)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--allow-student-history", action="store_true",
+                        help="允许冻结题输入中已有的对话历史作为上下文；不包含目标参考答案、rubric、teacher scores、工具或服务端会话状态")
     parser.add_argument("--budget-state", type=Path, default=Path("本地资料/claude参考预算.json"))
     parser.add_argument("--max-output-tokens", type=int, default=8192)
     parser.add_argument("--dry-run", action="store_true", help="只检查 cases，不读取凭据或联网")
