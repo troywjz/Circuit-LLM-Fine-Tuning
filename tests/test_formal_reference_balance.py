@@ -61,6 +61,59 @@ class FormalReferenceTests(unittest.TestCase):
         self.assertEqual(caller.call_count, 1)
         self.assertEqual(json.loads(self.output.read_text(encoding="utf-8"))["requested_model"], "configured-model")
 
+    def test_explicit_backup_skips_reference_order_and_balance_only_when_requested(self):
+        self.case["user_turns"] = []; self.write_cases([self.case])
+        response = {"text": "backup answer", "usage": {}, "finish_reason": "end_turn", "reported_model": "backup-model"}
+        with patch.object(build_demo_data, "ROOT", self.root), patch("teacher_api.load_config", return_value=self.config) as load, \
+             patch("teacher_api.load_profile_order", side_effect=AssertionError("backup must not consult primary order")), \
+             patch.object(reference, "_wallet", side_effect=AssertionError("wallet must be skipped")) as wallet, \
+             patch("teacher_api.call_teacher_messages", return_value=response) as caller:
+            self.assertEqual(reference.main(self.args("--teacher-profile", "backup", "--skip-balance-check")), 0)
+        self.assertEqual(load.call_args.kwargs, {"profile": "backup"})
+        wallet.assert_not_called()
+        caller.assert_called_once()
+        ledger = json.loads(self.state.read_text(encoding="utf-8"))
+        self.assertEqual(ledger["teacher_profile"], "backup")
+        self.assertIsNone(ledger["last_balance"])
+
+    def test_skip_balance_check_requires_account_mode(self):
+        with patch.object(build_demo_data, "ROOT", self.root), self.assertRaises(SystemExit) as caught:
+            reference.main(["--cases", str(self.cases), "--output", str(self.output),
+                            "--budget-state", str(self.state), "--skip-balance-check"])
+        self.assertEqual(caught.exception.code, 2)
+
+    def test_backup_is_rejected_by_legacy_budget_mode_before_loading_config(self):
+        with patch("teacher_api.load_config") as load, patch("teacher_api.call_teacher_messages") as caller:
+            with self.assertRaises(SystemExit) as caught:
+                reference.main(["--cases", str(self.cases), "--output", str(self.output),
+                                "--budget-state", str(self.state), "--teacher-profile", "backup"])
+        self.assertEqual(caught.exception.code, 2)
+        load.assert_not_called()
+        caller.assert_not_called()
+
+    def test_primary_cannot_skip_balance_check(self):
+        with patch("teacher_api.load_config") as load, patch("teacher_api.call_teacher_messages") as caller:
+            with self.assertRaises(SystemExit) as caught:
+                reference.main(self.args("--skip-balance-check"))
+        self.assertEqual(caught.exception.code, 2)
+        load.assert_not_called()
+        caller.assert_not_called()
+
+    def test_resume_rejects_changed_balance_strategy_before_request(self):
+        self.case["user_turns"] = []; self.write_cases([self.case])
+        response = {"text": "answer", "usage": {}, "finish_reason": "end_turn", "reported_model": "backup-model"}
+        with patch.object(build_demo_data, "ROOT", self.root), patch("teacher_api.load_config", return_value=self.config), \
+             patch("teacher_api.call_teacher_messages", return_value=response) as caller, \
+             patch.object(reference, "_wallet", return_value=5) as wallet:
+            self.assertEqual(reference.main(self.args("--teacher-profile", "backup", "--skip-balance-check")), 0)
+            caller.reset_mock()
+            self.assertEqual(reference.main(self.args("--teacher-profile", "backup", "--resume")), 2)
+        caller.assert_not_called()
+        wallet.assert_not_called()
+        state = json.loads(self.state.read_text(encoding="utf-8"))
+        self.assertEqual(state["teacher_profile"], "backup")
+        self.assertTrue(state["run_fingerprint"])
+
     def test_timeout_or_server_failure_is_unknown_and_never_reposted(self):
         for status in (None, 500):
             with self.subTest(status=status), tempfile.TemporaryDirectory() as temp:
