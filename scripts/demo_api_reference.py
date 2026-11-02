@@ -145,6 +145,8 @@ def _fingerprint(config, args, cases_hash: str) -> str:
              "extra_body": config.extra_body,
              "teacher_profile": getattr(args, "effective_teacher_profile", getattr(args, "teacher_profile", "primary")),
              "cases_sha256": cases_hash}
+    if getattr(args, "skip_balance_check", False):
+        value["skip_balance_check"] = True
     return _sha(json.dumps(value, sort_keys=True, ensure_ascii=False).encode())
 
 
@@ -176,13 +178,14 @@ def _run_account(args, cases: list[dict], cases_hash: str) -> int:
     if len({output, state_path, cases_path}) != 3:
         raise DemoDataError("参考输出、账户账本和题目文件必须是不同文件")
     profile = getattr(args, "teacher_profile", "primary")
-    if profile != "primary":
-        raise DemoDataError("强参考账户模式只允许 primary profile；未发送参考请求")
-    try:
-        if load_profile_order(args.env_file, "reference") != ("primary",):
-            raise DemoDataError("TEACHER_PROFILE_ORDER_REFERENCE 必须为 primary；未发送参考请求")
-    except TeacherError as exc:
-        raise DemoDataError(f"参考 profile 顺序无效；未发送参考请求：{exc}") from None
+    if profile == "primary":
+        try:
+            if load_profile_order(args.env_file, "reference") != ("primary",):
+                raise DemoDataError("TEACHER_PROFILE_ORDER_REFERENCE 必须为 primary；未发送参考请求")
+        except TeacherError as exc:
+            raise DemoDataError(f"参考 profile 顺序无效；未发送参考请求：{exc}") from None
+    elif profile != "backup":
+        raise DemoDataError("强参考账户模式只允许显式选择 primary 或 backup；未发送参考请求")
     args.effective_teacher_profile = profile
     for case in cases:
         roles = [m["role"] for m in case["input_messages"]]
@@ -310,19 +313,22 @@ def _run_account(args, cases: list[dict], cases_hash: str) -> int:
                     user_turn = planned_turns[index]
                     if user_turn is not None:
                         history.append({"role": "user", "content": user_turn})
-                    try:
-                        balance = _wallet(config)
-                    except DemoDataError:
-                        save("balance_unknown", running_case_id=None, running_turn_index=None, last_balance=None)
-                        raise
-                    if not isinstance(balance, (int, float)) or isinstance(balance, bool) or not math.isfinite(balance):
-                        save("balance_unknown", running_case_id=None, running_turn_index=None, last_balance=None)
-                        raise DemoDataError("余额无法确认；停止参考请求")
-                    if state.get("starting_balance") is None:
-                        state["starting_balance"] = balance
-                    if balance <= 0:
-                        save("balance_zero", running_case_id=None, running_turn_index=None, last_balance=balance)
-                        raise DemoDataError("账户余额为零；已保存参考进度")
+                    if args.skip_balance_check:
+                        balance = None
+                    else:
+                        try:
+                            balance = _wallet(config)
+                        except DemoDataError:
+                            save("balance_unknown", running_case_id=None, running_turn_index=None, last_balance=None)
+                            raise
+                        if not isinstance(balance, (int, float)) or isinstance(balance, bool) or not math.isfinite(balance):
+                            save("balance_unknown", running_case_id=None, running_turn_index=None, last_balance=None)
+                            raise DemoDataError("余额无法确认；停止参考请求")
+                        if state.get("starting_balance") is None:
+                            state["starting_balance"] = balance
+                        if balance <= 0:
+                            save("balance_zero", running_case_id=None, running_turn_index=None, last_balance=balance)
+                            raise DemoDataError("账户余额为零；已保存参考进度")
                     save("request_unknown", running_case_id=case["case_id"], running_turn_index=index,
                          last_balance=balance, last_error_category=None, last_http_status=None, last_error_reason=None)
                     began = time.perf_counter()
@@ -389,7 +395,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     parser.add_argument("--model-id", help="强参考模型 ID；账户余额模式默认使用环境配置")
     parser.add_argument("--teacher-profile", choices=("primary", "backup", "tertiary"), default="primary",
-                        help="强参考账户模式仅允许 primary profile")
+                        help="强参考账户模式固定使用所选 profile；仅支持 primary 或 backup")
     parser.add_argument("--run-label", default="claude-opus-5-5")
     parser.add_argument("--step0", type=int, default=0)
     parser.add_argument("--limit", type=int)
@@ -400,9 +406,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-output-tokens", type=int, default=8192)
     parser.add_argument("--dry-run", action="store_true", help="只检查 cases，不读取凭据或联网")
     parser.add_argument("--use-account-balance", action="store_true", help="使用账户实时余额，不设置旧 Demo 保留额")
+    parser.add_argument("--skip-balance-check", action="store_true",
+                        help="仅账户模式可用；跳过余额查询，适用于无余额接口的备用 profile；请求错误仍停止")
     args = parser.parse_args(argv)
     if args.step0 < 0 or args.max_output_tokens < 1 or (args.limit is not None and args.limit < 1):
         parser.error("step0 必须非负，max-output-tokens 和 limit 必须为正数")
+    if args.skip_balance_check and not args.use_account_balance:
+        parser.error("--skip-balance-check 仅允许与 --use-account-balance 一起使用")
+    if not args.use_account_balance and args.teacher_profile != "primary":
+        parser.error("旧预算模式只支持默认 primary；backup/tertiary 必须明确使用 --use-account-balance")
+    if args.skip_balance_check and args.teacher_profile != "backup":
+        parser.error("--skip-balance-check 仅允许与 --teacher-profile backup 一起使用")
     try:
         cases = _read_cases(args.cases, None if args.use_account_balance else args.limit)
         cases_hash = _sha(args.cases.read_bytes())
