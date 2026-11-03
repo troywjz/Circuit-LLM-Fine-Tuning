@@ -202,7 +202,8 @@ def _fingerprint(config, args, cases_hash: str) -> str:
              "teacher_profile": getattr(args, "effective_teacher_profile", getattr(args, "teacher_profile", "primary")),
              "cases_sha256": cases_hash}
     if (getattr(args, "skip_balance_check", False)
-            and getattr(args, "effective_teacher_profile", getattr(args, "teacher_profile", "primary")) != "tertiary"):
+            and getattr(args, "effective_teacher_profile", getattr(args, "teacher_profile", "primary"))
+            not in {"tertiary", "deepseek"}):
         value["skip_balance_check"] = True
     return _sha(json.dumps(value, sort_keys=True, ensure_ascii=False).encode())
 
@@ -246,8 +247,6 @@ def _run_account(args, cases: list[dict], cases_hash: str) -> int:
             raise DemoDataError(f"参考 profile 顺序无效；未发送参考请求：{exc}") from None
     elif profile not in {"backup", "tertiary", "deepseek"}:
         raise DemoDataError("强参考账户模式只允许显式选择 primary、backup、tertiary 或 deepseek；未发送参考请求")
-    if profile == "deepseek" and args.skip_balance_check:
-        raise DemoDataError("DeepSeek profile 不允许跳过余额检查；未发送参考请求")
     args.effective_teacher_profile = profile
     for case in cases:
         roles = [m["role"] for m in case["input_messages"]]
@@ -513,7 +512,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true", help="只检查 cases，不读取凭据或联网")
     parser.add_argument("--use-account-balance", action="store_true", help="使用账户实时余额，不设置旧 Demo 保留额")
     parser.add_argument("--skip-balance-check", action="store_true",
-                        help="仅账户模式可用；跳过余额查询，适用于无余额接口的备用 profile；请求错误仍停止")
+                        help="仅账户模式可用；primary禁止。用户授权后可跳过余额查询，账本记录 balance_check_skipped=true；API请求错误仍停止")
     args = parser.parse_args(argv)
     if (args.step0 < 0 or (args.max_output_tokens is not None and args.max_output_tokens < 1)
             or (args.limit is not None and args.limit < 1)):
@@ -522,8 +521,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--skip-balance-check 仅允许与 --use-account-balance 一起使用")
     if not args.use_account_balance and args.teacher_profile != "primary":
         parser.error("旧预算模式只支持默认 primary；backup/tertiary/deepseek 必须明确使用 --use-account-balance")
-    if args.skip_balance_check and args.teacher_profile not in {"backup", "tertiary"}:
-        parser.error("--skip-balance-check 仅允许与 --teacher-profile backup 或 tertiary 一起使用；deepseek不可跳过")
+    if args.skip_balance_check and args.teacher_profile not in {"backup", "tertiary", "deepseek"}:
+        parser.error("--skip-balance-check 仅允许与 --teacher-profile backup、tertiary 或 deepseek 一起使用；primary禁止")
     try:
         cases = _read_cases(args.cases, None if args.use_account_balance else args.limit)
         cases_hash = _sha(args.cases.read_bytes())
