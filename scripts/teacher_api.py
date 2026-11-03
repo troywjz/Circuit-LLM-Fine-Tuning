@@ -44,6 +44,7 @@ class TeacherConfig:
     openai_max_tokens_field: str = "max_completion_tokens"
     extra_body: dict[str, Any] = field(default_factory=dict)
     user_agent: str = "CircuitLLM/0.1"
+    profile: str = "primary"
 
 
 _PLACEHOLDERS = {"", "your_api_key", "your-api-key", "replace_me", "changeme", "none", "null"}
@@ -51,8 +52,10 @@ _PROTECTED_EXTRA = {
     "model", "messages", "input", "instructions", "system", "stream",
     "max_tokens", "max_completion_tokens", "max_output_tokens",
 }
-# 三个备选接口按调用顺位命名：primary 第一，backup 第二，tertiary 第三。
-_PROFILES = {"primary": "TEACHER_", "backup": "TEACHER_BACKUP_", "tertiary": "TEACHER_TERTIARY_"}
+# primary/backup/tertiary 是既有路由顺位；deepseek 是显式单独选择的账户，不加入顺位。
+_PROFILES = {"primary": "TEACHER_", "backup": "TEACHER_BACKUP_",
+             "tertiary": "TEACHER_TERTIARY_", "deepseek": "TEACHER_DEEPSEEK_"}
+_PROFILE_ORDER_PROFILES = {"primary", "backup", "tertiary"}
 
 
 def _classify_http_error(exc: urllib.error.HTTPError) -> TeacherError:
@@ -189,7 +192,7 @@ def load_profile_order(env_file: Path, case: str) -> tuple[str, ...]:
     else:
         raw = values.get(key, ",".join(defaults[case]))
     order = tuple(item.strip().lower() for item in raw.split(","))
-    if (not order or any(item not in _PROFILES for item in order)
+    if (not order or any(item not in _PROFILE_ORDER_PROFILES for item in order)
             or len(set(order)) != len(order)):
         raise TeacherError(f"{key} 只能是逗号分隔且不重复的 primary/backup/tertiary。")
     return order
@@ -199,7 +202,7 @@ def load_config(env_file: Path, *, require_credentials: bool = True,
                 profile: str = "primary") -> TeacherConfig:
     """读取明确选择的API配置；主配置、备用配置与第三顺位配置互不混用。"""
     if profile not in _PROFILES:
-        raise TeacherError("Teacher profile 只能是 primary、backup 或 tertiary。")
+        raise TeacherError("Teacher profile 只能是 primary、backup、tertiary 或 deepseek。")
     prefix = _PROFILES[profile]
     values = _parse_env_file(Path(env_file))
     names = (
@@ -224,6 +227,9 @@ def load_config(env_file: Path, *, require_credentials: bool = True,
         raise TeacherError(f"{prefix}OPENAI_API 仅支持 responses 或 chat_completions。")
     if token_field not in {"max_completion_tokens", "max_tokens"}:
         raise TeacherError(f"{prefix}OPENAI_MAX_TOKENS_FIELD 配置无效。")
+    if profile == "deepseek" and (provider != "openai" or api != "chat_completions"
+                                  or token_field != "max_tokens"):
+        raise TeacherError("TEACHER_DEEPSEEK 必须使用 openai/chat_completions 和 max_tokens。")
     try:
         max_tokens = int(get("MAX_OUTPUT_TOKENS", "8192"))
         timeout = float(get("TIMEOUT_SECONDS", "120"))
@@ -256,16 +262,23 @@ def load_config(env_file: Path, *, require_credentials: bool = True,
     forbidden = _PROTECTED_EXTRA.intersection(extra)
     if forbidden:
         raise TeacherError(f"{prefix}EXTRA_BODY_JSON 包含受保护的请求字段。")
-    return TeacherConfig(provider, base, key, model, api, max_tokens, timeout, retries,
-                         proxy, token_field, extra, user_agent)
+    return TeacherConfig(provider=provider, base_url=base, api_key=key, model_id=model,
+                         openai_api=api, max_output_tokens=max_tokens,
+                         timeout_seconds=timeout, max_retries=retries,
+                         proxy_url=proxy, openai_max_tokens_field=token_field,
+                         extra_body=extra, user_agent=user_agent, profile=profile)
 
 
 def endpoint_url(config: TeacherConfig) -> str:
     """为协议构造 endpoint；保留网关自定义路径前缀。"""
-    base = _safe_url(config.base_url, "TEACHER_BASE_URL", allow_empty=False)
+    profile = getattr(config, "profile", "primary")
+    base_name = "TEACHER_DEEPSEEK_BASE_URL" if profile == "deepseek" else "TEACHER_BASE_URL"
+    base = _safe_url(config.base_url, base_name, allow_empty=False)
     path = urlsplit(base).path.rstrip("/")
     if not path:
-        path = "/v1"
+        # DeepSeek's official root base is already the API root; its Chat Completions
+        # endpoint is /chat/completions (no implicit /v1 prefix).
+        path = "" if profile == "deepseek" else "/v1"
     if config.provider == "openai":
         suffix = "/responses" if config.openai_api == "responses" else "/chat/completions"
     elif config.provider == "anthropic":

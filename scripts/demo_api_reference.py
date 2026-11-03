@@ -1,4 +1,4 @@
-"""用已配置的文本 API 为冻结 cases 生成 Claude 强参考答案。"""
+"""用已配置的文本 API 为冻结 cases 生成独立参考答案。"""
 from __future__ import annotations
 
 import argparse
@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit, urlunsplit
@@ -134,6 +135,61 @@ def _wallet(config) -> float | None:
     return None
 
 
+def _deepseek_balance(config) -> dict | None:
+    """查询DeepSeek官方同源余额端点；未知或不完整响应不允许继续生成。"""
+    from teacher_api import _NoRedirect
+
+    parts = urlsplit(config.base_url)
+    base_path = parts.path.rstrip("/")
+    if base_path.endswith(("/responses", "/messages", "/chat/completions")):
+        base_path = base_path.rsplit("/", 1)[0]
+    # DeepSeek官方余额接口位于origin根下，不在Chat Completions的/v1路径下。
+    if base_path.endswith("/v1"):
+        base_path = base_path[:-3]
+    balance_path = base_path + "/user/balance" if base_path else "/user/balance"
+    url = urlunsplit((parts.scheme, parts.netloc, balance_path, "", ""))
+    headers = {"Accept": "application/json", "User-Agent": config.user_agent or "CircuitLLM/0.1",
+               "Authorization": "Bearer " + config.api_key}
+    request = Request(url, headers=headers)
+    host = (parts.hostname or "").lower()
+    handlers = [ProxyHandler({})] if host in {"localhost", "127.0.0.1", "::1"} else (
+        [ProxyHandler({"http": config.proxy_url, "https": config.proxy_url})] if config.proxy_url else [ProxyHandler()])
+    try:
+        with build_opener(_NoRedirect(), *handlers).open(
+                request, timeout=min(config.timeout_seconds, 30)) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        raise DemoDataError(f"DeepSeek余额查询失败（HTTP {exc.code}）；未继续生成") from None
+    except (URLError, TimeoutError, OSError, UnicodeError, json.JSONDecodeError):
+        raise DemoDataError("DeepSeek余额无法确认；未继续生成") from None
+    if not isinstance(data, dict) or not isinstance(data.get("is_available"), bool):
+        return None
+    is_available = data["is_available"]
+    raw_infos = data.get("balance_infos")
+    if not isinstance(raw_infos, list) or not raw_infos:
+        return {"is_available": False, "balance_infos": []} if not is_available else None
+    infos: list[dict[str, str]] = []
+    currencies: set[str] = set()
+    for item in raw_infos:
+        if not isinstance(item, dict):
+            return {"is_available": False, "balance_infos": []} if not is_available else None
+        currency = item.get("currency")
+        raw_total = item.get("total_balance")
+        if not isinstance(currency, str) or currency not in {"CNY", "USD"}:
+            return {"is_available": False, "balance_infos": []} if not is_available else None
+        if currency in currencies or not isinstance(raw_total, (str, int, float)) or isinstance(raw_total, bool):
+            return {"is_available": False, "balance_infos": []} if not is_available else None
+        try:
+            total = Decimal(str(raw_total))
+        except (InvalidOperation, ValueError):
+            return {"is_available": False, "balance_infos": []} if not is_available else None
+        if not total.is_finite() or total < 0:
+            return {"is_available": False, "balance_infos": []} if not is_available else None
+        currencies.add(currency)
+        infos.append({"currency": currency, "total_balance": str(raw_total)})
+    return {"is_available": is_available, "balance_infos": infos}
+
+
 def _fingerprint(config, args, cases_hash: str) -> str:
     parts = urlsplit(config.base_url)
     # 不把密钥纳入指纹；完整请求配置用于阻止不同解码设置或超时的结果混跑。
@@ -169,6 +225,10 @@ def _run_account(args, cases: list[dict], cases_hash: str) -> int:
     from teacher_api import TeacherError, call_teacher_messages, load_config, load_profile_order
 
     private_root = (ROOT / "本地资料").resolve()
+    profile = getattr(args, "teacher_profile", "primary")
+    if args.budget_state is None:
+        args.budget_state = (Path("本地资料/deepseek参考账本.json") if profile == "deepseek"
+                             else Path("本地资料/claude参考预算.json"))
     output, state_path = args.output.resolve(), args.budget_state.resolve()
     try:
         output.relative_to(private_root)
@@ -178,15 +238,16 @@ def _run_account(args, cases: list[dict], cases_hash: str) -> int:
     cases_path = args.cases.resolve()
     if len({output, state_path, cases_path}) != 3:
         raise DemoDataError("参考输出、账户账本和题目文件必须是不同文件")
-    profile = getattr(args, "teacher_profile", "primary")
     if profile == "primary":
         try:
             if load_profile_order(args.env_file, "reference") != ("primary",):
                 raise DemoDataError("TEACHER_PROFILE_ORDER_REFERENCE 必须为 primary；未发送参考请求")
         except TeacherError as exc:
             raise DemoDataError(f"参考 profile 顺序无效；未发送参考请求：{exc}") from None
-    elif profile not in {"backup", "tertiary"}:
-        raise DemoDataError("强参考账户模式只允许显式选择 primary、backup 或 tertiary；未发送参考请求")
+    elif profile not in {"backup", "tertiary", "deepseek"}:
+        raise DemoDataError("强参考账户模式只允许显式选择 primary、backup、tertiary 或 deepseek；未发送参考请求")
+    if profile == "deepseek" and args.skip_balance_check:
+        raise DemoDataError("DeepSeek profile 不允许跳过余额检查；未发送参考请求")
     args.effective_teacher_profile = profile
     for case in cases:
         roles = [m["role"] for m in case["input_messages"]]
@@ -199,7 +260,14 @@ def _run_account(args, cases: list[dict], cases_hash: str) -> int:
     except TeacherError as exc:
         raise DemoDataError(f"{profile} API 配置无效；未发送参考请求：{exc}") from None
     config.model_id = args.model_id or config.model_id
-    config.max_output_tokens = args.max_output_tokens
+    if not args.run_label:
+        args.run_label = config.model_id if profile == "deepseek" else "claude-opus-5-5"
+    if args.max_output_tokens is not None:
+        config.max_output_tokens = args.max_output_tokens
+    elif profile != "deepseek":
+        # 保留既有账户profile的CLI默认值；DeepSeek使用自己的环境变量默认16384。
+        config.max_output_tokens = 8192
+    args.max_output_tokens = config.max_output_tokens
     config.max_retries = 0
     _validate_reference_config(config)
     fingerprint = _fingerprint(config, args, cases_hash)
@@ -263,6 +331,9 @@ def _run_account(args, cases: list[dict], cases_hash: str) -> int:
                 state = {"mode": "account_balance_reference", "run_fingerprint": fingerprint,
                          "teacher_profile": profile,
                          "cases_sha256": cases_hash, "starting_balance": None, "last_balance": None}
+                if profile == "deepseek":
+                    state.update({"balance_currency": None, "balance_currencies": [],
+                                  "balance_infos": [], "balance_is_available": None})
             state["balance_check_skipped"] = bool(args.skip_balance_check)
 
             def save(status: str, **extra) -> None:
@@ -315,8 +386,36 @@ def _run_account(args, cases: list[dict], cases_hash: str) -> int:
                     user_turn = planned_turns[index]
                     if user_turn is not None:
                         history.append({"role": "user", "content": user_turn})
+                    balance_currency = None
+                    balance_currencies: list[str] = []
+                    balance_infos: list[dict[str, str]] = []
+                    balance_is_available: bool | None = None
                     if args.skip_balance_check:
                         balance = None
+                    elif profile == "deepseek":
+                        try:
+                            snapshot = _deepseek_balance(config)
+                        except DemoDataError:
+                            save("balance_unknown", running_case_id=None, running_turn_index=None,
+                                 last_balance=None, balance_is_available=None)
+                            raise
+                        if snapshot is None:
+                            save("balance_unknown", running_case_id=None, running_turn_index=None,
+                                 last_balance=None, balance_is_available=None)
+                            raise DemoDataError("DeepSeek余额无法确认；已停止参考请求")
+                        balance_is_available = snapshot["is_available"]
+                        balance_infos = snapshot["balance_infos"]
+                        balance_currencies = [item["currency"] for item in balance_infos]
+                        balance_currency = balance_currencies[0] if len(balance_currencies) == 1 else None
+                        balance = {item["currency"]: item["total_balance"] for item in balance_infos}
+                        if state.get("starting_balance") is None:
+                            state["starting_balance"] = balance
+                        if not balance_is_available or not any(Decimal(item["total_balance"]) > 0 for item in balance_infos):
+                            save("balance_insufficient", running_case_id=None, running_turn_index=None,
+                                 last_balance=balance, balance_currency=balance_currency,
+                                 balance_currencies=balance_currencies, balance_infos=balance_infos,
+                                 balance_is_available=balance_is_available)
+                            raise DemoDataError("DeepSeek余额不足或is_available为false；已停止参考请求")
                     else:
                         try:
                             balance = _wallet(config)
@@ -332,7 +431,12 @@ def _run_account(args, cases: list[dict], cases_hash: str) -> int:
                             save("balance_zero", running_case_id=None, running_turn_index=None, last_balance=balance)
                             raise DemoDataError("账户余额为零；已保存参考进度")
                     save("request_unknown", running_case_id=case["case_id"], running_turn_index=index,
-                         last_balance=balance, last_error_category=None, last_http_status=None, last_error_reason=None)
+                         last_balance=balance, last_error_category=None, last_http_status=None, last_error_reason=None,
+                         **({"balance_currency": balance_currency,
+                             "balance_currencies": balance_currencies,
+                             "balance_infos": balance_infos,
+                             "balance_is_available": balance_is_available}
+                            if profile == "deepseek" else {}))
                     began = time.perf_counter()
                     try:
                         response = call_teacher_messages(config, history)
@@ -396,29 +500,30 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     parser.add_argument("--model-id", help="强参考模型 ID；账户余额模式默认使用环境配置")
-    parser.add_argument("--teacher-profile", choices=("primary", "backup", "tertiary"), default="primary",
-                        help="强参考账户模式固定使用所选 profile；支持 primary、backup 或 tertiary")
-    parser.add_argument("--run-label", default="claude-opus-5-5")
+    parser.add_argument("--teacher-profile", choices=("primary", "backup", "tertiary", "deepseek"), default="primary",
+                        help="强参考账户模式固定使用所选 profile；DeepSeek须显式选择并检查账户余额")
+    parser.add_argument("--run-label", default=None)
     parser.add_argument("--step0", type=int, default=0)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--allow-student-history", action="store_true",
                         help="允许冻结题输入中已有的对话历史作为上下文；不包含目标参考答案、rubric、teacher scores、工具或服务端会话状态")
-    parser.add_argument("--budget-state", type=Path, default=Path("本地资料/claude参考预算.json"))
-    parser.add_argument("--max-output-tokens", type=int, default=8192)
+    parser.add_argument("--budget-state", type=Path, default=None)
+    parser.add_argument("--max-output-tokens", type=int, default=None)
     parser.add_argument("--dry-run", action="store_true", help="只检查 cases，不读取凭据或联网")
     parser.add_argument("--use-account-balance", action="store_true", help="使用账户实时余额，不设置旧 Demo 保留额")
     parser.add_argument("--skip-balance-check", action="store_true",
                         help="仅账户模式可用；跳过余额查询，适用于无余额接口的备用 profile；请求错误仍停止")
     args = parser.parse_args(argv)
-    if args.step0 < 0 or args.max_output_tokens < 1 or (args.limit is not None and args.limit < 1):
+    if (args.step0 < 0 or (args.max_output_tokens is not None and args.max_output_tokens < 1)
+            or (args.limit is not None and args.limit < 1)):
         parser.error("step0 必须非负，max-output-tokens 和 limit 必须为正数")
     if args.skip_balance_check and not args.use_account_balance:
         parser.error("--skip-balance-check 仅允许与 --use-account-balance 一起使用")
     if not args.use_account_balance and args.teacher_profile != "primary":
-        parser.error("旧预算模式只支持默认 primary；backup/tertiary 必须明确使用 --use-account-balance")
+        parser.error("旧预算模式只支持默认 primary；backup/tertiary/deepseek 必须明确使用 --use-account-balance")
     if args.skip_balance_check and args.teacher_profile not in {"backup", "tertiary"}:
-        parser.error("--skip-balance-check 仅允许与 --teacher-profile backup 或 tertiary 一起使用")
+        parser.error("--skip-balance-check 仅允许与 --teacher-profile backup 或 tertiary 一起使用；deepseek不可跳过")
     try:
         cases = _read_cases(args.cases, None if args.use_account_balance else args.limit)
         cases_hash = _sha(args.cases.read_bytes())
@@ -431,8 +536,10 @@ def main(argv: list[str] | None = None) -> int:
         args.effective_teacher_profile = "primary"
         from teacher_api import TeacherError, call_teacher_messages, load_config
         config = load_config(args.env_file)
+        args.run_label = args.run_label or "claude-opus-5-5"
         config.model_id = args.model_id or "claude-opus-5-5"
-        config.max_output_tokens = args.max_output_tokens
+        config.max_output_tokens = args.max_output_tokens or 8192
+        args.max_output_tokens = config.max_output_tokens
         config.max_retries = 0
         _validate_reference_config(config)
         fingerprint = _fingerprint(config, args, cases_hash)
@@ -456,7 +563,7 @@ def main(argv: list[str] | None = None) -> int:
         balance = _wallet(config)
         if balance is None or not math.isfinite(balance) or balance < 0.50:
             raise DemoDataError("USD 余额不可确认或低于 $0.50 保留额；停止请求")
-        state_path = args.budget_state
+        state_path = args.budget_state or Path("本地资料/claude参考预算.json")
         if state_path.exists():
             try:
                 state = json.loads(state_path.read_text(encoding="utf-8"))
