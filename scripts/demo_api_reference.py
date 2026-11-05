@@ -203,7 +203,7 @@ def _fingerprint(config, args, cases_hash: str) -> str:
              "cases_sha256": cases_hash}
     if (getattr(args, "skip_balance_check", False)
             and getattr(args, "effective_teacher_profile", getattr(args, "teacher_profile", "primary"))
-            not in {"tertiary", "deepseek"}):
+            not in {"tertiary", "deepseek", "qwen"}):
         value["skip_balance_check"] = True
     return _sha(json.dumps(value, sort_keys=True, ensure_ascii=False).encode())
 
@@ -228,7 +228,9 @@ def _run_account(args, cases: list[dict], cases_hash: str) -> int:
     private_root = (ROOT / "本地资料").resolve()
     profile = getattr(args, "teacher_profile", "primary")
     if args.budget_state is None:
-        args.budget_state = (Path("本地资料/deepseek参考账本.json") if profile == "deepseek"
+        account_ledgers = {"deepseek": "deepseek参考账本.json",
+                           "qwen": "qwen参考账本.json"}
+        args.budget_state = (Path("本地资料") / account_ledgers[profile] if profile in account_ledgers
                              else Path("本地资料/claude参考预算.json"))
     output, state_path = args.output.resolve(), args.budget_state.resolve()
     try:
@@ -245,8 +247,8 @@ def _run_account(args, cases: list[dict], cases_hash: str) -> int:
                 raise DemoDataError("TEACHER_PROFILE_ORDER_REFERENCE 必须为 primary；未发送参考请求")
         except TeacherError as exc:
             raise DemoDataError(f"参考 profile 顺序无效；未发送参考请求：{exc}") from None
-    elif profile not in {"backup", "tertiary", "deepseek"}:
-        raise DemoDataError("强参考账户模式只允许显式选择 primary、backup、tertiary 或 deepseek；未发送参考请求")
+    elif profile not in {"backup", "tertiary", "deepseek", "qwen"}:
+        raise DemoDataError("强参考账户模式只允许显式选择 primary、backup、tertiary、deepseek 或 qwen；未发送参考请求")
     args.effective_teacher_profile = profile
     for case in cases:
         roles = [m["role"] for m in case["input_messages"]]
@@ -260,11 +262,11 @@ def _run_account(args, cases: list[dict], cases_hash: str) -> int:
         raise DemoDataError(f"{profile} API 配置无效；未发送参考请求：{exc}") from None
     config.model_id = args.model_id or config.model_id
     if not args.run_label:
-        args.run_label = config.model_id if profile == "deepseek" else "claude-opus-5-5"
+        args.run_label = config.model_id if profile in {"deepseek", "qwen"} else "claude-opus-5-5"
     if args.max_output_tokens is not None:
         config.max_output_tokens = args.max_output_tokens
-    elif profile != "deepseek":
-        # 保留既有账户profile的CLI默认值；DeepSeek使用自己的环境变量默认16384。
+    elif profile not in {"deepseek", "qwen"}:
+        # 保留既有账户profile的CLI默认值；独立账户使用各自环境变量中的 token 上限。
         config.max_output_tokens = 8192
     args.max_output_tokens = config.max_output_tokens
     config.max_retries = 0
@@ -499,8 +501,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     parser.add_argument("--model-id", help="强参考模型 ID；账户余额模式默认使用环境配置")
-    parser.add_argument("--teacher-profile", choices=("primary", "backup", "tertiary", "deepseek"), default="primary",
-                        help="强参考账户模式固定使用所选 profile；DeepSeek须显式选择并检查账户余额")
+    parser.add_argument("--teacher-profile", choices=("primary", "backup", "tertiary", "deepseek", "qwen"), default="primary",
+                        help="强参考账户模式固定使用所选 profile；DeepSeek/Qwen须显式选择并检查账户余额")
     parser.add_argument("--run-label", default=None)
     parser.add_argument("--step0", type=int, default=0)
     parser.add_argument("--limit", type=int)
@@ -520,9 +522,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.skip_balance_check and not args.use_account_balance:
         parser.error("--skip-balance-check 仅允许与 --use-account-balance 一起使用")
     if not args.use_account_balance and args.teacher_profile != "primary":
-        parser.error("旧预算模式只支持默认 primary；backup/tertiary/deepseek 必须明确使用 --use-account-balance")
-    if args.skip_balance_check and args.teacher_profile not in {"backup", "tertiary", "deepseek"}:
-        parser.error("--skip-balance-check 仅允许与 --teacher-profile backup、tertiary 或 deepseek 一起使用；primary禁止")
+        parser.error("旧预算模式只支持默认 primary；backup/tertiary/deepseek/qwen 必须明确使用 --use-account-balance")
+    if args.skip_balance_check and args.teacher_profile not in {"backup", "tertiary", "deepseek", "qwen"}:
+        parser.error("--skip-balance-check 仅允许与 --teacher-profile backup、tertiary、deepseek 或 qwen 一起使用；primary禁止")
     try:
         cases = _read_cases(args.cases, None if args.use_account_balance else args.limit)
         cases_hash = _sha(args.cases.read_bytes())

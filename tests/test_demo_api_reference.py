@@ -68,6 +68,38 @@ class TeacherProfileTests(unittest.TestCase):
             load_config(env, profile="tertiary")
         self.assertIn("TEACHER_TERTIARY_API_KEY", str(ctx.exception))
 
+    def test_qwen_profile_uses_its_own_chat_completions_configuration(self):
+        env = self._env(
+            "TEACHER_PROFILE_ORDER_REFERENCE=primary\n"
+            "TEACHER_QWEN_PROVIDER=openai\n"
+            "TEACHER_QWEN_OPENAI_API=chat_completions\n"
+            "TEACHER_QWEN_BASE_URL=https://qwen.invalid/v1\n"
+            "TEACHER_QWEN_API_KEY=qwen-key-222\n"
+            "TEACHER_QWEN_MODEL_ID=Qwen3.8-27B\n"
+            "TEACHER_QWEN_OPENAI_MAX_TOKENS_FIELD=max_tokens\n"
+        )
+        cfg = load_config(env, profile="qwen")
+        self.assertEqual((cfg.profile, cfg.provider, cfg.openai_api),
+                         ("qwen", "openai", "chat_completions"))
+        self.assertEqual((cfg.base_url, cfg.model_id, cfg.openai_max_tokens_field),
+                         ("https://qwen.invalid/v1", "Qwen3.8-27B", "max_tokens"))
+        self.assertEqual(load_profile_order(env, "reference"), ("primary",))
+
+    def test_qwen_profile_accepts_other_globally_supported_protocols(self):
+        for provider, api in (("openai", "responses"), ("anthropic", "responses")):
+            with self.subTest(provider=provider, api=api):
+                env = self._env(
+                    "TEACHER_PROFILE_ORDER_REFERENCE=primary\n"
+                    f"TEACHER_QWEN_PROVIDER={provider}\n"
+                    f"TEACHER_QWEN_OPENAI_API={api}\n"
+                    "TEACHER_QWEN_BASE_URL=https://qwen.invalid/v1\n"
+                    "TEACHER_QWEN_API_KEY=qwen-key-222\n"
+                    "TEACHER_QWEN_MODEL_ID=Qwen3.8-27B\n"
+                )
+                cfg = load_config(env, profile="qwen")
+                self.assertEqual((cfg.provider, cfg.openai_api), (provider, api))
+                self.assertEqual(load_profile_order(env, "reference"), ("primary",))
+
 
 class FakeResponse:
     def __init__(self, payload):

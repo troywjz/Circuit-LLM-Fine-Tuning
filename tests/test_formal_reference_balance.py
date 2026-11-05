@@ -6,6 +6,7 @@ import json
 import sys
 import tempfile
 import unittest
+from contextlib import chdir
 from pathlib import Path
 from unittest.mock import patch
 
@@ -75,6 +76,43 @@ class FormalReferenceTests(unittest.TestCase):
         ledger = json.loads(self.state.read_text(encoding="utf-8"))
         self.assertEqual(ledger["teacher_profile"], "backup")
         self.assertIsNone(ledger["last_balance"])
+
+    def test_explicit_qwen_profile_can_skip_balance_and_defaults_label_to_model_id(self):
+        self.case["user_turns"] = []
+        self.write_cases([self.case])
+        self.config.profile = "qwen"
+        self.config.model_id = "Qwen3.8-27B"
+        response = {"text": "qwen answer", "usage": {}, "finish_reason": "stop", "reported_model": "Qwen3.8-27B"}
+        with patch.object(build_demo_data, "ROOT", self.root), \
+             chdir(self.root), \
+             patch("teacher_api.load_config", return_value=self.config) as load, \
+             patch("teacher_api.load_profile_order", side_effect=AssertionError("qwen must not consult automatic order")), \
+             patch.object(reference, "_wallet", side_effect=AssertionError("balance skip must be explicit")) as wallet, \
+             patch("teacher_api.call_teacher_messages", return_value=response) as caller:
+            self.assertEqual(reference.main([
+                "--cases", str(self.cases), "--output", str(self.output),
+                "--env-file", str(self.private / "missing.env"),
+                "--use-account-balance", "--teacher-profile", "qwen", "--skip-balance-check",
+            ]), 0)
+        self.assertEqual(load.call_args.kwargs, {"profile": "qwen"})
+        wallet.assert_not_called()
+        caller.assert_called_once()
+        row = json.loads(self.output.read_text(encoding="utf-8"))
+        ledger_path = self.private / "qwen参考账本.json"
+        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+        self.assertEqual((row["model"], row["requested_model"]), ("Qwen3.8-27B", "Qwen3.8-27B"))
+        self.assertEqual(ledger["teacher_profile"], "qwen")
+        self.assertTrue(ledger["balance_check_skipped"])
+
+    def test_qwen_checks_balance_by_default(self):
+        self.config.profile = "qwen"
+        with patch.object(build_demo_data, "ROOT", self.root), \
+             patch("teacher_api.load_config", return_value=self.config), \
+             patch.object(reference, "_wallet", return_value=0) as wallet, \
+             patch("teacher_api.call_teacher_messages") as caller:
+            self.assertEqual(reference.main(self.args("--teacher-profile", "qwen")), 2)
+        wallet.assert_called_once()
+        caller.assert_not_called()
 
     def test_skip_balance_check_requires_account_mode(self):
         with patch.object(build_demo_data, "ROOT", self.root), self.assertRaises(SystemExit) as caught:
