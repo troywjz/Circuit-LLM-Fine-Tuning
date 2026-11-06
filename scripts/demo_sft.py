@@ -14,7 +14,7 @@ from pathlib import Path
 from demo_data_utils import DemoDataError, read_jsonl, tokenize_assistant_only
 from qwen35_common import DEFAULT_MODEL_PATH, load_unsloth_model
 
-DEFAULT_OUTPUT = Path("本地资料/Demo-V1/实验/run-001")
+DEFAULT_OUTPUT = Path("experiments/qlora/checkpoints/qwen35-demo-smoke")
 SEED = 3407
 
 

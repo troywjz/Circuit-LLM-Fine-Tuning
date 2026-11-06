@@ -495,9 +495,9 @@ def write_outputs(out: Path, items: list[dict[str, Any]], failures: list[dict[st
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="生成严格待审的电路对话候选数据。")
-    parser.add_argument("--input", type=Path, default=ROOT / "本地资料" / "数据准备" / "原始资料输入.jsonl")
+    parser.add_argument("--input", type=Path, default=ROOT / "本地资料" / "正式实验" / "工具输入" / "原始资料输入.jsonl")
     parser.add_argument("--env-file", type=Path, default=ROOT / ".env")
-    parser.add_argument("--output-dir", type=Path, default=ROOT / "本地资料" / "数据准备" / "候选输出")
+    parser.add_argument("--output-dir", type=Path, default=ROOT / "本地资料" / "正式实验" / "数据整理候选" / "通用")
     parser.add_argument("--limit", type=int, default=3)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--check-config", action="store_true")
