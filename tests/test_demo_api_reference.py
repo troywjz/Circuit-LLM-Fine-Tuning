@@ -85,6 +85,26 @@ class TeacherProfileTests(unittest.TestCase):
                          ("https://qwen.invalid/v1", "Qwen3.8-27B", "max_tokens"))
         self.assertEqual(load_profile_order(env, "reference"), ("primary",))
 
+    def test_kimi_profile_reads_only_its_own_variables(self):
+        env = self._env(
+            "TEACHER_QWEN_BASE_URL=https://qwen.invalid/v1\n"
+            "TEACHER_QWEN_API_KEY=qwen-key-222\n"
+            "TEACHER_QWEN_MODEL_ID=Qwen3.8-27B\n"
+            "TEACHER_KIMI_PROVIDER=openai\n"
+            "TEACHER_KIMI_OPENAI_API=chat_completions\n"
+            "TEACHER_KIMI_BASE_URL=https://kimi.invalid/v1\n"
+            "TEACHER_KIMI_API_KEY=kimi-key-333\n"
+            "TEACHER_KIMI_MODEL_ID=kimi-k3.1-pro\n"
+            "TEACHER_KIMI_OPENAI_MAX_TOKENS_FIELD=max_tokens\n"
+            "TEACHER_KIMI_EXTRA_BODY_JSON={\"enable_thinking\": false}\n"
+        )
+        qwen, kimi = load_config(env, profile="qwen"), load_config(env, profile="kimi")
+        self.assertEqual((qwen.base_url, qwen.api_key, qwen.model_id),
+                         ("https://qwen.invalid/v1", "qwen-key-222", "Qwen3.8-27B"))
+        self.assertEqual((kimi.profile, kimi.base_url, kimi.api_key, kimi.model_id),
+                         ("kimi", "https://kimi.invalid/v1", "kimi-key-333", "kimi-k3.1-pro"))
+        self.assertEqual(kimi.extra_body, {"enable_thinking": False})
+
     def test_qwen_profile_accepts_other_globally_supported_protocols(self):
         for provider, api in (("openai", "responses"), ("anthropic", "responses")):
             with self.subTest(provider=provider, api=api):

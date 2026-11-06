@@ -104,6 +104,33 @@ class FormalReferenceTests(unittest.TestCase):
         self.assertEqual(ledger["teacher_profile"], "qwen")
         self.assertTrue(ledger["balance_check_skipped"])
 
+    def test_explicit_kimi_profile_uses_its_own_ledger_and_skips_balance(self):
+        self.case["user_turns"] = []
+        self.write_cases([self.case])
+        self.config.profile = "kimi"
+        self.config.model_id = "kimi-k3.1-pro"
+        response = {"text": "kimi answer", "usage": {}, "finish_reason": "stop", "reported_model": "kimi-k3.1-pro"}
+        with patch.object(build_demo_data, "ROOT", self.root), \
+             chdir(self.root), \
+             patch("teacher_api.load_config", return_value=self.config) as load, \
+             patch("teacher_api.load_profile_order", side_effect=AssertionError("kimi must not consult automatic order")), \
+             patch.object(reference, "_wallet", side_effect=AssertionError("balance skip must be explicit")) as wallet, \
+             patch("teacher_api.call_teacher_messages", return_value=response) as caller:
+            self.assertEqual(reference.main([
+                "--cases", str(self.cases), "--output", str(self.output),
+                "--env-file", str(self.private / "missing.env"),
+                "--use-account-balance", "--teacher-profile", "kimi", "--skip-balance-check",
+            ]), 0)
+        self.assertEqual(load.call_args.kwargs, {"profile": "kimi"})
+        wallet.assert_not_called()
+        caller.assert_called_once()
+        row = json.loads(self.output.read_text(encoding="utf-8"))
+        ledger_path = self.private / "kimi参考账本.json"
+        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+        self.assertEqual((row["model"], row["requested_model"]), ("kimi-k3.1-pro", "kimi-k3.1-pro"))
+        self.assertEqual(ledger["teacher_profile"], "kimi")
+        self.assertTrue(ledger["balance_check_skipped"])
+
     def test_qwen_checks_balance_by_default(self):
         self.config.profile = "qwen"
         with patch.object(build_demo_data, "ROOT", self.root), \

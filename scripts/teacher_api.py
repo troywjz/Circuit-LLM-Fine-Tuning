@@ -52,10 +52,12 @@ _PROTECTED_EXTRA = {
     "model", "messages", "input", "instructions", "system", "stream",
     "max_tokens", "max_completion_tokens", "max_output_tokens",
 }
-# primary/backup/tertiary 是既有路由顺位；deepseek/qwen 是显式单独选择的账户，不加入顺位。
+# primary/backup/tertiary 是既有路由顺位；deepseek/qwen/kimi 是显式单独选择的账户，不加入顺位。
 _PROFILES = {"primary": "TEACHER_", "backup": "TEACHER_BACKUP_",
              "tertiary": "TEACHER_TERTIARY_", "deepseek": "TEACHER_DEEPSEEK_",
-             "qwen": "TEACHER_QWEN_"}
+             "qwen": "TEACHER_QWEN_", "kimi": "TEACHER_KIMI_"}
+# 各自持有独立账户与端点、必须显式选择、且允许跳过余额查询的 profile。
+_EXPLICIT_ACCOUNT_PROFILES = {"deepseek", "qwen", "kimi"}
 _PROFILE_ORDER_PROFILES = {"primary", "backup", "tertiary"}
 
 
@@ -203,7 +205,7 @@ def load_config(env_file: Path, *, require_credentials: bool = True,
                 profile: str = "primary") -> TeacherConfig:
     """读取明确选择的API配置；主配置、备用配置与第三顺位配置互不混用。"""
     if profile not in _PROFILES:
-        raise TeacherError("Teacher profile 只能是 primary、backup、tertiary、deepseek 或 qwen。")
+        raise TeacherError("Teacher profile 只能是 primary、backup、tertiary、deepseek、qwen 或 kimi。")
     prefix = _PROFILES[profile]
     values = _parse_env_file(Path(env_file))
     names = (
@@ -273,7 +275,8 @@ def load_config(env_file: Path, *, require_credentials: bool = True,
 def endpoint_url(config: TeacherConfig) -> str:
     """为协议构造 endpoint；保留网关自定义路径前缀。"""
     profile = getattr(config, "profile", "primary")
-    base_name = f"TEACHER_{profile.upper()}_BASE_URL" if profile in {"deepseek", "qwen"} else "TEACHER_BASE_URL"
+    base_name = (f"TEACHER_{profile.upper()}_BASE_URL"
+                 if profile in _EXPLICIT_ACCOUNT_PROFILES else "TEACHER_BASE_URL")
     base = _safe_url(config.base_url, base_name, allow_empty=False)
     path = urlsplit(base).path.rstrip("/")
     if not path:
